@@ -18,16 +18,18 @@ import time
 import json
 import base64
 import hashlib
+import hmac
 import secrets
 import pyotp
 from contextvars import ContextVar
 
 
 
-from urllib.parse import quote  # Понадобится для безопасного кодирования текста ссылки
+from urllib.parse import quote, parse_qsl  # Понадобится для безопасного кодирования текста ссылки
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Dict, Optional, Tuple, List, Any
+from mnemonic import Mnemonic
 from contextlib import asynccontextmanager
 from asyncio import Semaphore
 from functools import lru_cache, wraps
@@ -42,11 +44,21 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 
+try:
+    from cryptobot_config import CRYPTOBOT_PAY_TOKEN
+except ModuleNotFoundError as exc:
+    if exc.name != "cryptobot_config":
+        raise
+    CRYPTOBOT_PAY_TOKEN = ""
+CRYPTOBOT_PAY_TOKEN = str(CRYPTOBOT_PAY_TOKEN or "").strip()
+if CRYPTOBOT_PAY_TOKEN == "PASTE_CRYPTO_PAY_APP_TOKEN_HERE":
+    CRYPTOBOT_PAY_TOKEN = ""
+
 BOT_TOKEN = '8758197515:AAH_t6JAkbgUFLJua91kTr1OHJCCF7naCMM'
 XROCKET_PAY_TOKEN = '3b1dafa8033b841c69982b273'
-ADMIN_ID = 8564318687
+ADMIN_ID = 8962244177
 # Telegram Stars are charged as an integer amount; keep the business balance in USDT.
-STAR_USDT_RATE = float(os.getenv("STAR_USDT_RATE", "100"))
+STAR_USDT_RATE = float(os.getenv("STAR_USDT_RATE", "91"))
 
 # Константы
 PAYMENT_CHECK_INTERVAL = 15
@@ -65,9 +77,14 @@ MAX_BULK_ADD = 5000
 
 AGREEMENT_URL = "https://telegra.ph/Polzovatelskoe-soglashenie-Telegram-bota-AlteraStoreBot-09-07"
 PRIVACY_POLICY_URL = "https://telegra.ph/Politika-konfidencialnosti-Telegram-bota-AlteraStoreBot-09-07"
-SUPPORT_URL = "https://t.me/EleghantHelpBot"
-SUPPORT_ACCOUNT_URL = "https://t.me/EleghantSupport"
-WEB_APP_URL = os.getenv("ALTERA_WEB_APP_URL", "").strip()
+SUPPORT_URL = "https://t.me/HelpALTR"
+SUPPORT_ACCOUNT_URL = "https://t.me/devAltera"
+REFERRAL_BOT_USERNAME = "AlteraneBot"
+WEB_APP_URL = os.getenv(
+    "ALTERA_WEB_APP_URL",
+    "https://stackkaije.github.io/AlteraWebApp/",
+).strip()
+WEB_APP_INIT_DATA_MAX_AGE = int(os.getenv("ALTERA_WEB_APP_INIT_DATA_MAX_AGE", "86400"))
 
 # --- РЕЖИМ ТЕХ. РАБОТ ---
 MAINTENANCE_MODE = False
@@ -86,6 +103,7 @@ class CustomEmoji:
     BACK = "5215248628548931525"
     START = "6035130900075777681"
     XROCKET_PAY = "5379612946747921985"
+    CRYPTOBOT_PAY = "5361914370068613491"
     BALANCE_PAY = "5276398496008663230"
     CHECKMARK = "5278411813468269386"
     GY = "5343742152985839675"
@@ -564,12 +582,15 @@ class MaintenanceMiddleware:
 
 dp.update.middleware(MaintenanceMiddleware())
 
-pending_payments: Dict[int, Dict] = {}
-pending_balance_payments: Dict[int, Dict] = {}
+pending_payments: Dict[Any, Dict] = {}
+pending_balance_payments: Dict[Any, Dict] = {}
 pending_inline_checks: Dict[str, Dict[str, Any]] = {}
 user_promo_attempts: Dict[int, Tuple[int, float]] = {}
+webapp_deposit_lock = asyncio.Lock()
+webapp_recovery_pending: Dict[int, dict] = {}
 
 payment_check_semaphore = Semaphore(MAX_CONCURRENT_PAYMENT_CHECKS)
+payment_finalize_lock = asyncio.Lock()
 db_connection = None
 
 # --- СОСТОЯНИЯ ---
@@ -630,21 +651,18 @@ class AdminState(StatesGroup):
 
 # --- КЛАВИАТУРА ГЛАВНОГО МЕНЮ ---
 def main_keyboard() -> ReplyKeyboardMarkup:
-    catalog_btn = KeyboardButton(text="Ассортимент", icon_custom_emoji_id="4924802255430880504", style='success')
     profile_btn = KeyboardButton(text="Профиль", icon_custom_emoji_id="5213043033993421435", style='primary')
-    deposit_btn = KeyboardButton(text="Пополнить баланс", icon_custom_emoji_id="4924714844256470686")
-    help_btn = KeyboardButton(text="Поддержка", icon_custom_emoji_id="5213021000811189009", style='danger')
-    faq_btn = KeyboardButton(text="FAQ", icon_custom_emoji_id="5212948901195190028")
+    help_btn = KeyboardButton(text="Поддержка", icon_custom_emoji_id="5213021000811189009", style='primary')
+    faq_btn = KeyboardButton(text="FAQ", icon_custom_emoji_id="5212948901195190028", style='primary')
     kb = [
-        [catalog_btn],
         [help_btn, profile_btn],
-        [deposit_btn, faq_btn]
+        [faq_btn]
     ]
     if WEB_APP_URL:
-        kb.insert(1, [KeyboardButton(
+        kb.insert(0, [KeyboardButton(
             text="Открыть в WebApp",
-            web_app=WebAppInfo(url=WEB_APP_URL),
-            style="success",
+            icon_custom_emoji_id="5213338489088677310",
+            style="primary",
         )])
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
@@ -704,6 +722,62 @@ async def transaction():
     await conn.execute("BEGIN IMMEDIATE")
     return conn
 
+async def create_webapp_order(
+    user_id: int, total: float, payment_method: str,
+    invoice_id: Optional[str] = None, item_count: int = 0,
+    idempotency_key: Optional[str] = None,
+) -> dict:
+    """Create a durable order before an external payment is opened."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn = await transaction()
+    try:
+        existing = None
+        if idempotency_key:
+            existing = await (await conn.execute(
+                "SELECT id, order_number, created_at, invoice_id, status, total, payment_method "
+                "FROM orders WHERE user_id = ? AND idempotency_key = ?",
+                (user_id, idempotency_key),
+            )).fetchone()
+        if existing:
+            await conn.commit()
+            return {
+                "id": existing[0], "number": existing[1], "created_at": existing[2],
+                "invoice_id": existing[3], "status": existing[4],
+                "total": existing[5], "payment_method": existing[6], "existing": True,
+            }
+        cursor = await conn.execute(
+            "INSERT INTO orders (user_id, total, payment_method, status, invoice_id, item_count, created_at, idempotency_key) "
+            "VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)",
+            (user_id, round(float(total), 2), payment_method, invoice_id, item_count, now, idempotency_key),
+        )
+        order_id = cursor.lastrowid
+        order_number = f"ALT-{datetime.now(timezone.utc):%Y%m%d}-{order_id:06d}"
+        await conn.execute(
+            "UPDATE orders SET order_number = ? WHERE id = ?",
+            (order_number, order_id)
+        )
+        await conn.commit()
+        return {"id": order_id, "number": order_number, "created_at": now}
+    except Exception:
+        await conn.rollback()
+        raise
+
+async def update_order_status(order_id: Optional[int], status: str, **fields):
+    if not order_id:
+        return
+    allowed = {"paid_at", "fulfilled_at", "error", "invoice_id", "item_count"}
+    updates = ["status = ?"]
+    values = [status]
+    for key, value in fields.items():
+        if key in allowed:
+            updates.append(f"{key} = ?")
+            values.append(value)
+    values.append(order_id)
+    await execute_query(
+        f"UPDATE orders SET {', '.join(updates)} WHERE id = ? AND status NOT IN ('fulfilled', 'cancelled')",
+        tuple(values), commit=True,
+    )
+
 # --- ИНИЦИАЛИЗАЦИЯ БД ---
 async def init_db():
     conn = await get_db()
@@ -712,6 +786,21 @@ async def init_db():
         username TEXT, referrer_id INTEGER DEFAULT NULL, is_banned INTEGER DEFAULT 0,
         ban_reason TEXT DEFAULT NULL, banned_at TEXT DEFAULT NULL,
         privacy_accepted INTEGER DEFAULT 0, welcome_sent INTEGER DEFAULT 0
+    )''')
+    await conn.execute('''CREATE TABLE IF NOT EXISTS account_telegram_links (
+        telegram_id INTEGER PRIMARY KEY,
+        account_id INTEGER NOT NULL,
+        linked_at TEXT NOT NULL
+    )''')
+    await conn.execute('''CREATE TABLE IF NOT EXISTS account_recovery (
+        account_id INTEGER PRIMARY KEY,
+        phrase_hash TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL
+    )''')
+    await conn.execute('''CREATE TABLE IF NOT EXISTS account_recovery_attempts (
+        telegram_id INTEGER PRIMARY KEY,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        window_started REAL NOT NULL DEFAULT 0
     )''')
     await conn.execute('''CREATE TABLE IF NOT EXISTS faq_progress (
         user_id INTEGER NOT NULL,
@@ -741,6 +830,10 @@ async def init_db():
         await conn.execute("ALTER TABLE categories ADD COLUMN maintenance INTEGER DEFAULT 0")
     except Exception:
         pass
+    try:
+        await conn.execute("ALTER TABLE categories ADD COLUMN updated_at TEXT DEFAULT NULL")
+    except Exception:
+        pass
     await conn.execute('''CREATE TABLE IF NOT EXISTS inventory (
         id INTEGER PRIMARY KEY AUTOINCREMENT, cat_id INTEGER, data TEXT
     )''')
@@ -754,14 +847,59 @@ async def init_db():
     await conn.execute('''CREATE TABLE IF NOT EXISTS history (
     id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, item_data TEXT, date TEXT
     )''')
+    for col, definition in [
+        ("created_at", "TEXT"),
+        ("cat_id", "INTEGER"),
+        ("order_id", "INTEGER"),
+        ("order_number", "TEXT"),
+        ("payment_method", "TEXT"),
+        ("amount", "REAL"),
+        ("status", "TEXT DEFAULT 'delivered'"),
+    ]:
+        try:
+            await conn.execute(f"ALTER TABLE history ADD COLUMN {col} {definition}")
+        except Exception:
+            pass
+    await conn.execute('''CREATE TABLE IF NOT EXISTS orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_number TEXT UNIQUE,
+        user_id INTEGER NOT NULL,
+        total REAL NOT NULL DEFAULT 0,
+        payment_method TEXT NOT NULL DEFAULT 'balance',
+        status TEXT NOT NULL DEFAULT 'pending',
+        invoice_id TEXT UNIQUE,
+        item_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        paid_at TEXT DEFAULT NULL,
+        fulfilled_at TEXT DEFAULT NULL,
+        error TEXT DEFAULT NULL
+    )''')
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_user_created ON orders(user_id, created_at DESC)")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_invoice ON orders(invoice_id)")
     try:
-        await conn.execute("ALTER TABLE history ADD COLUMN created_at TEXT")
+        await conn.execute("ALTER TABLE orders ADD COLUMN idempotency_key TEXT")
     except Exception:
         pass
-    try:
-        await conn.execute("ALTER TABLE history ADD COLUMN cat_id INTEGER")
-    except Exception:
-        pass
+    await conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_user_idempotency "
+        "ON orders(user_id, idempotency_key) WHERE idempotency_key IS NOT NULL"
+    )
+    await conn.execute('''CREATE TABLE IF NOT EXISTS favorites (
+        user_id INTEGER NOT NULL,
+        cat_id INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (user_id, cat_id)
+    )''')
+    for col, definition in [
+        ("notify_price", "INTEGER NOT NULL DEFAULT 1"),
+        ("notify_stock", "INTEGER NOT NULL DEFAULT 1"),
+        ("last_price", "REAL"),
+        ("last_stock", "INTEGER"),
+    ]:
+        try:
+            await conn.execute(f"ALTER TABLE favorites ADD COLUMN {col} {definition}")
+        except Exception:
+            pass
     await conn.execute('''CREATE TABLE IF NOT EXISTS referrals (
         id INTEGER PRIMARY KEY AUTOINCREMENT, referrer_id INTEGER, referral_id INTEGER UNIQUE, date TEXT
     )''')
@@ -815,6 +953,18 @@ async def init_db():
             await conn.execute(f"ALTER TABLE balance_checks ADD COLUMN {col} {definition}")
         except Exception:
             pass
+    await conn.execute('''CREATE TABLE IF NOT EXISTS balance_check_claims (
+        check_id INTEGER NOT NULL,
+        claimant_id INTEGER NOT NULL,
+        claimed_at TEXT NOT NULL,
+        PRIMARY KEY (check_id, claimant_id),
+        FOREIGN KEY (check_id) REFERENCES balance_checks(id) ON DELETE CASCADE
+    )''')
+    await conn.execute(
+        "INSERT OR IGNORE INTO balance_check_claims (check_id, claimant_id, claimed_at) "
+        "SELECT id, claimed_by, COALESCE(claimed_at, created_at) FROM balance_checks "
+        "WHERE claimed_by IS NOT NULL"
+    )
     await conn.execute(
         "UPDATE balance_checks SET total_amount = amount, max_claims = 1, claimed_count = 0 "
         "WHERE total_amount IS NULL"
@@ -839,6 +989,44 @@ async def init_db():
         rating INTEGER NOT NULL CHECK(rating BETWEEN 1 AND 5), text TEXT DEFAULT '',
         created_at TEXT NOT NULL, UNIQUE(user_id, cat_id)
     )''')
+    await conn.execute('''CREATE TABLE IF NOT EXISTS p2p_listings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        seller_id INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL,
+        price_cents INTEGER NOT NULL CHECK(price_cents > 0),
+        status TEXT NOT NULL DEFAULT 'pending'
+            CHECK(status IN ('pending', 'active', 'reserved', 'sold', 'cancelled', 'rejected')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (seller_id) REFERENCES users(id)
+    )''')
+    await conn.execute('''CREATE TABLE IF NOT EXISTS p2p_deals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        listing_id INTEGER NOT NULL,
+        seller_id INTEGER NOT NULL,
+        buyer_id INTEGER NOT NULL,
+        price_cents INTEGER NOT NULL CHECK(price_cents > 0),
+        fee_cents INTEGER NOT NULL CHECK(fee_cents >= 0),
+        total_cents INTEGER NOT NULL CHECK(total_cents > 0),
+        status TEXT NOT NULL DEFAULT 'funded'
+            CHECK(status IN ('funded', 'delivered', 'disputed', 'released', 'refunded')),
+        idempotency_key TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        delivered_at TEXT DEFAULT NULL,
+        deadline_at TEXT DEFAULT NULL,
+        completed_at TEXT DEFAULT NULL,
+        dispute_reason TEXT DEFAULT NULL,
+        resolution_note TEXT DEFAULT NULL,
+        UNIQUE (buyer_id, idempotency_key),
+        FOREIGN KEY (listing_id) REFERENCES p2p_listings(id),
+        FOREIGN KEY (seller_id) REFERENCES users(id),
+        FOREIGN KEY (buyer_id) REFERENCES users(id)
+    )''')
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_p2p_listings_status_created ON p2p_listings(status, created_at DESC)")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_p2p_deals_buyer_status ON p2p_deals(buyer_id, status, created_at DESC)")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_p2p_deals_seller_status ON p2p_deals(seller_id, status, created_at DESC)")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_p2p_deals_deadline ON p2p_deals(status, deadline_at)")
     # Таблица для TOTP-ключей
     await conn.execute('''CREATE TABLE IF NOT EXISTS totp_keys (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1129,8 +1317,19 @@ async def claim_balance_check(
             )
             await conn.commit()
             return "expired", amount, creator_id, comment
+        previous_claim = await (await conn.execute(
+            "SELECT 1 FROM balance_check_claims WHERE check_id = ? AND claimant_id = ?",
+            (check_id, claimant_id),
+        )).fetchone()
+        if previous_claim:
+            await conn.rollback()
+            return "already_claimed_by_user", amount, creator_id, comment
         new_claimed_count = claimed_count + 1
         new_status = "claimed" if new_claimed_count >= max_claims else "active"
+        await conn.execute(
+            "INSERT INTO balance_check_claims (check_id, claimant_id, claimed_at) VALUES (?, ?, ?)",
+            (check_id, claimant_id, now.isoformat()),
+        )
         await conn.execute(
             "UPDATE balance_checks SET status = ?, claimed_by = ?, claimed_at = ?, claimed_count = ? "
             "WHERE id = ? AND status = 'active'",
@@ -1248,17 +1447,57 @@ class BanCheckMiddleware:
 dp.update.middleware(BanCheckMiddleware())
 
 # --- ФУНКЦИЯ ПОКУПКИ С ТРАНЗАКЦИЕЙ ---
-async def buy_items_with_transaction(cat_id: int, quantity: int, user_id: int, total: float) -> Optional[List[tuple]]:
+async def _apply_percent_promo_in_transaction(
+    conn, user_id: int, promo_code: Optional[str], total: float
+) -> Optional[float]:
+    if not promo_code:
+        return round(total, 2)
+    promo = await (await conn.execute(
+        "SELECT amount, max_uses, used, promo_type FROM promo_codes WHERE code = ?",
+        (promo_code,),
+    )).fetchone()
+    if not promo or promo[3] != "percent" or int(promo[2] or 0) >= int(promo[1] or 0):
+        return None
+    used = await (await conn.execute(
+        "SELECT 1 FROM promo_usage WHERE code = ? AND user_id = ? LIMIT 1",
+        (promo_code, user_id),
+    )).fetchone()
+    if used:
+        return None
+    discount = min(max(float(promo[0]), 0), 100)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    await conn.execute(
+        "INSERT INTO promo_usage (code, user_id, username, used_at) "
+        "SELECT ?, ?, COALESCE(username, ''), ? FROM users WHERE id = ?",
+        (promo_code, user_id, now, user_id),
+    )
+    await conn.execute("UPDATE promo_codes SET used = used + 1 WHERE code = ?", (promo_code,))
+    return round(total * (1 - discount / 100), 2)
+
+async def buy_items_with_transaction(
+    cat_id: int, quantity: int, user_id: int, total: float,
+    promo_code: Optional[str] = None, order_id: Optional[int] = None,
+    payment_method: str = "balance",
+) -> Optional[List[tuple]]:
     stock = await fetchone("SELECT COUNT(*) FROM inventory WHERE cat_id = ?", (cat_id,))
     stock_count = stock[0] if stock else 0
     if stock_count < quantity:
         return None
-    if total > 0:
-        balance = await get_balance(user_id)
-        if balance < total:
-            return None
     conn = await transaction()
     try:
+        if order_id:
+            existing_order = await (await conn.execute(
+                "SELECT status FROM orders WHERE id = ? AND user_id = ?", (order_id, user_id)
+            )).fetchone()
+            if existing_order and existing_order[0] in ("paid", "fulfilled"):
+                await conn.rollback()
+                return []
+        charged_total = await _apply_percent_promo_in_transaction(
+            conn, user_id, promo_code, total
+        )
+        if charged_total is None:
+            await conn.rollback()
+            return None
         cursor = await conn.execute("SELECT id, data FROM inventory WHERE cat_id = ? LIMIT ?", (cat_id, quantity))
         items = await cursor.fetchall()
         if len(items) < quantity:
@@ -1270,16 +1509,41 @@ async def buy_items_with_transaction(cat_id: int, quantity: int, user_id: int, t
         now = datetime.now(timezone.utc)
         now_str = now.strftime("%d.%m %H:%M")      # для старого поля date
         now_iso = now.isoformat()                  # для нового поля created_at
-        history_data = [(user_id, cat_id, item[1], now_str, now_iso) for item in items]
+        if not order_id:
+            cursor = await conn.execute(
+                "INSERT INTO orders (user_id, total, payment_method, status, item_count, created_at) "
+                "VALUES (?, ?, ?, 'paid', ?, ?)",
+                (user_id, charged_total, payment_method, quantity, now_iso),
+            )
+            order_id = cursor.lastrowid
+            order_number = f"ALT-{now:%Y%m%d}-{order_id:06d}"
+            await conn.execute("UPDATE orders SET order_number = ?, paid_at = ?, fulfilled_at = ? WHERE id = ?",
+                               (order_number, now_iso, now_iso, order_id))
+        else:
+            order_row = await (await conn.execute(
+                "SELECT order_number FROM orders WHERE id = ?", (order_id,)
+            )).fetchone()
+            order_number = order_row[0] if order_row else str(order_id)
+            await conn.execute(
+                "UPDATE orders SET status = 'fulfilled', paid_at = ?, fulfilled_at = ?, item_count = ? "
+                "WHERE id = ? AND status NOT IN ('fulfilled', 'cancelled')",
+                (now_iso, now_iso, quantity, order_id),
+            )
+        history_data = [
+            (user_id, cat_id, item[1], now_str, now_iso, order_id, order_number,
+             payment_method, round(charged_total / max(quantity, 1), 2), "delivered")
+            for item in items
+        ]
         await conn.executemany(
-            "INSERT INTO history (user_id, cat_id, item_data, date, created_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO history (user_id, cat_id, item_data, date, created_at, order_id, "
+            "order_number, payment_method, amount, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             history_data
         )
         await conn.execute("UPDATE users SET total = total + ? WHERE id = ?", (quantity, user_id))
-        if total > 0:
+        if charged_total > 0:
             balance_cursor = await conn.execute(
                 "UPDATE balances SET balance = balance - ? WHERE user_id = ? AND balance >= ?",
-                (total, user_id, total)
+                (charged_total, user_id, charged_total)
             )
             if balance_cursor.rowcount != 1:
                 await conn.rollback()
@@ -1289,6 +1553,97 @@ async def buy_items_with_transaction(cat_id: int, quantity: int, user_id: int, t
     except Exception as e:
         await conn.rollback()
         logger.error(f"Transaction error: {e}")
+        raise
+
+async def buy_cart_with_transaction(
+    cart_items: List[Tuple[int, int]], user_id: int, total: float,
+    promo_code: Optional[str] = None, order_id: Optional[int] = None,
+    payment_method: str = "balance",
+) -> Optional[List[tuple]]:
+    """Atomically reserve every cart line, write history, and charge balance."""
+    if not cart_items or total < 0:
+        return None
+    conn = await transaction()
+    try:
+        if order_id:
+            existing_order = await (await conn.execute(
+                "SELECT status FROM orders WHERE id = ? AND user_id = ?", (order_id, user_id)
+            )).fetchone()
+            if existing_order and existing_order[0] in ("paid", "fulfilled"):
+                await conn.rollback()
+                return []
+        charged_total = await _apply_percent_promo_in_transaction(
+            conn, user_id, promo_code, total
+        )
+        if charged_total is None:
+            await conn.rollback()
+            return None
+        selected_items = []
+        total_quantity = 0
+        for cat_id, quantity in cart_items:
+            cursor = await conn.execute(
+                "SELECT id, data FROM inventory WHERE cat_id = ? LIMIT ?",
+                (cat_id, quantity),
+            )
+            items = await cursor.fetchall()
+            if len(items) < quantity:
+                await conn.rollback()
+                return None
+            selected_items.extend((cat_id, item_id, data) for item_id, data in items)
+            total_quantity += quantity
+        if charged_total > 0:
+            balance_cursor = await conn.execute(
+                "UPDATE balances SET balance = balance - ? WHERE user_id = ? AND balance >= ?",
+                (charged_total, user_id, charged_total),
+            )
+            if balance_cursor.rowcount != 1:
+                await conn.rollback()
+                return None
+        now = datetime.now(timezone.utc)
+        now_str = now.strftime("%d.%m %H:%M")
+        now_iso = now.isoformat()
+        if not order_id:
+            cursor = await conn.execute(
+                "INSERT INTO orders (user_id, total, payment_method, status, item_count, created_at) "
+                "VALUES (?, ?, ?, 'paid', ?, ?)",
+                (user_id, charged_total, payment_method, total_quantity, now_iso),
+            )
+            order_id = cursor.lastrowid
+            order_number = f"ALT-{now:%Y%m%d}-{order_id:06d}"
+            await conn.execute("UPDATE orders SET order_number = ?, paid_at = ?, fulfilled_at = ? WHERE id = ?",
+                               (order_number, now_iso, now_iso, order_id))
+        else:
+            order_row = await (await conn.execute(
+                "SELECT order_number FROM orders WHERE id = ?", (order_id,)
+            )).fetchone()
+            order_number = order_row[0] if order_row else str(order_id)
+            await conn.execute(
+                "UPDATE orders SET status = 'fulfilled', paid_at = ?, fulfilled_at = ?, item_count = ? "
+                "WHERE id = ? AND status NOT IN ('fulfilled', 'cancelled')",
+                (now_iso, now_iso, total_quantity, order_id),
+            )
+        for cat_id, item_id, item_data in selected_items:
+            await conn.execute("DELETE FROM inventory WHERE id = ?", (item_id,))
+            await conn.execute(
+                "INSERT INTO history (user_id, cat_id, item_data, date, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (user_id, cat_id, item_data, now_str, now_iso),
+            )
+            await conn.execute(
+                "UPDATE history SET order_id = ?, order_number = ?, payment_method = ?, "
+                "amount = ?, status = 'delivered' WHERE id = last_insert_rowid()",
+                (order_id, order_number, payment_method,
+                 round(charged_total / max(total_quantity, 1), 2)),
+            )
+        await conn.execute(
+            "UPDATE users SET total = total + ? WHERE id = ?",
+            (total_quantity, user_id),
+        )
+        await conn.commit()
+        return [(item_id, item_data) for _, item_id, item_data in selected_items]
+    except Exception:
+        await conn.rollback()
+        logger.exception("Cart transaction error")
         raise
 
 # --- XROCKET PAY API ---
@@ -1378,6 +1733,104 @@ def _xrocket_is_paid(status: Optional[str], paid_amount) -> bool:
 def _xrocket_is_expired(status: Optional[str]) -> bool:
     return bool(status) and str(status).lower() in ('expired', 'cancelled', 'canceled')
 
+CRYPTOBOT_API_URL = "https://pay.crypt.bot/api"
+
+async def cryptobot_request(method: str, payload: dict) -> dict:
+    if not CRYPTOBOT_PAY_TOKEN:
+        return {
+            "ok": False,
+            "description": "CryptoBot Pay не настроен. Укажите токен в cryptobot_config.py.",
+        }
+    timeout = aiohttp.ClientTimeout(total=30)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                f"{CRYPTOBOT_API_URL}/{method}",
+                json=payload,
+                headers={"Crypto-Pay-API-Token": CRYPTOBOT_PAY_TOKEN},
+            ) as response:
+                try:
+                    result = await response.json(content_type=None)
+                except (aiohttp.ContentTypeError, json.JSONDecodeError):
+                    logger.error("CryptoBot API returned invalid JSON for %s (HTTP %s)", method, response.status)
+                    return {"ok": False, "description": "CryptoBot вернул некорректный ответ"}
+                if response.status >= 400 or not isinstance(result, dict) or result.get("ok") is not True:
+                    error = result.get("error") if isinstance(result, dict) else None
+                    description = (
+                        error.get("name") or error.get("message")
+                        if isinstance(error, dict) else None
+                    ) or (result.get("description") if isinstance(result, dict) else None)
+                    logger.warning("CryptoBot API %s failed (HTTP %s): %s", method, response.status, description or "unknown error")
+                    return {"ok": False, "description": description or "Ошибка CryptoBot Pay API"}
+                return {"ok": True, "result": result.get("result")}
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        logger.warning("CryptoBot API %s request failed: %s", method, exc)
+        return {"ok": False, "description": "Не удалось связаться с CryptoBot Pay"}
+
+def _cryptobot_extract_invoice(raw: dict) -> dict:
+    invoice = raw.get("result", raw) if isinstance(raw, dict) else raw
+    if isinstance(invoice, dict) and isinstance(invoice.get("items"), list):
+        invoice = invoice["items"][0] if invoice["items"] else {}
+    if not isinstance(invoice, dict):
+        return {}
+    return {
+        "id": invoice.get("invoice_id"),
+        "link": (
+            invoice.get("bot_invoice_url") or invoice.get("pay_url")
+            or invoice.get("mini_app_invoice_url") or invoice.get("web_app_invoice_url")
+        ),
+        "status": invoice.get("status"),
+        "raw": invoice,
+    }
+
+async def cryptobot_create_invoice(
+    amount: float, description: str, payload: str = "", expires_in: int = 1800,
+) -> dict:
+    result = await cryptobot_request("createInvoice", {
+        "currency_type": "crypto",
+        "asset": "USDT",
+        "accepted_assets": "USDT",
+        "amount": f"{amount:.2f}",
+        "description": description[:1024],
+        "payload": payload[:128],
+        "expires_in": expires_in,
+        "allow_comments": False,
+        "allow_anonymous": False,
+    })
+    if not result.get("ok"):
+        return result
+    invoice = _cryptobot_extract_invoice({"result": result.get("result")})
+    if not invoice.get("id") or not invoice.get("link"):
+        logger.error("CryptoBot createInvoice response did not include an invoice ID and payment URL")
+        return {"ok": False, "description": "CryptoBot не вернул ссылку на оплату"}
+    return {"ok": True, **invoice}
+
+async def cryptobot_get_invoice(invoice_id: str) -> dict:
+    result = await cryptobot_request("getInvoices", {"invoice_ids": str(invoice_id)})
+    if not result.get("ok"):
+        return result
+    invoice = _cryptobot_extract_invoice({"result": result.get("result")})
+    if not invoice.get("id"):
+        return {"ok": False, "description": "Счёт CryptoBot не найден"}
+    return {"ok": True, **invoice}
+
+async def get_provider_invoice(provider: str, invoice_id: str) -> dict:
+    if provider == "xrocket":
+        return await xrocket_get_invoice(str(invoice_id))
+    if provider == "cryptobot":
+        return await cryptobot_get_invoice(str(invoice_id))
+    return {"ok": False, "description": "Неизвестный способ оплаты"}
+
+def provider_invoice_is_paid(provider: str, invoice: dict) -> bool:
+    if provider == "cryptobot":
+        return str(invoice.get("status", "")).lower() == "paid"
+    return _xrocket_is_paid(invoice.get("status"), invoice.get("paid_amount"))
+
+def provider_invoice_is_expired(provider: str, invoice: dict) -> bool:
+    if provider == "cryptobot":
+        return str(invoice.get("status", "")).lower() == "expired"
+    return _xrocket_is_expired(invoice.get("status"))
+
 # --- ПРОВЕРКА ОПЛАТЫ ---
 async def check_deposit_payment(invoice_id, user_id: int, amount: float, msg_to_edit: types.Message, provider: str = "xrocket"):
     async with payment_check_semaphore:
@@ -1385,15 +1838,17 @@ async def check_deposit_payment(invoice_id, user_id: int, amount: float, msg_to_
             await asyncio.sleep(PAYMENT_CHECK_INTERVAL)
             if invoice_id not in pending_balance_payments:
                 return
-            if provider == "xrocket":
-                inv = await xrocket_get_invoice(str(invoice_id))
-                if not inv.get('ok'):
-                    continue
-                is_paid = _xrocket_is_paid(inv.get('status'), inv.get('paid_amount'))
-                is_expired = _xrocket_is_expired(inv.get('status'))
+            inv = await get_provider_invoice(provider, str(invoice_id))
+            if not inv.get("ok"):
+                continue
+            is_paid = provider_invoice_is_paid(provider, inv)
+            is_expired = provider_invoice_is_expired(provider, inv)
             if is_paid:
-                await update_balance(user_id, amount, "deposit")
-                del pending_balance_payments[invoice_id]
+                async with payment_finalize_lock:
+                    if invoice_id not in pending_balance_payments:
+                        return
+                    await update_balance(user_id, amount, "deposit")
+                    pending_balance_payments.pop(invoice_id, None)
                 await get_active_bot().send_message(user_id, f'<tg-emoji emoji-id="{CustomEmoji.PREORDER_CHECK}">✅</tg-emoji> Баланс успешно пополнен на {amount} USDT!', parse_mode="HTML")
                 try:
                     await msg_to_edit.delete()
@@ -1402,30 +1857,52 @@ async def check_deposit_payment(invoice_id, user_id: int, amount: float, msg_to_
                 return
             elif is_expired:
                 await msg_to_edit.edit_text(f'<tg-emoji emoji-id="{CustomEmoji.WARNING}">❌</tg-emoji> Счет просрочен. Попробуйте снова.', parse_mode="HTML")
-                del pending_balance_payments[invoice_id]
+                pending_balance_payments.pop(invoice_id, None)
                 return
         if invoice_id in pending_balance_payments:
             await msg_to_edit.edit_text(f'<tg-emoji emoji-id="{CustomEmoji.WARNING}">❌</tg-emoji> Время ожидания истекло. Если вы оплатили, обратитесь в поддержку.', parse_mode="HTML")
-            del pending_balance_payments[invoice_id]
+            pending_balance_payments.pop(invoice_id, None)
 
 async def auto_check_payment(invoice_id, user_id: int, cat_id: int, quantity: int,
-                            msg_to_edit: types.Message, total_cost: float, provider: str = "xrocket"):
+                            msg_to_edit: types.Message, total_cost: float, provider: str = "xrocket",
+                            cart_items: Optional[List[Tuple[int, int]]] = None):
     async with payment_check_semaphore:
         for attempt in range(PAYMENT_CHECK_ATTEMPTS):
             await asyncio.sleep(PAYMENT_CHECK_INTERVAL)
             if invoice_id not in pending_payments:
                 return
-            if provider == "xrocket":
-                inv = await xrocket_get_invoice(str(invoice_id))
-                if not inv.get('ok'):
-                    continue
-                is_paid = _xrocket_is_paid(inv.get('status'), inv.get('paid_amount'))
-                is_expired = _xrocket_is_expired(inv.get('status'))
+            inv = await get_provider_invoice(provider, str(invoice_id))
+            if not inv.get("ok"):
+                continue
+            is_paid = provider_invoice_is_paid(provider, inv)
+            is_expired = provider_invoice_is_expired(provider, inv)
             if is_paid:
-                items = await buy_items_with_transaction(cat_id, quantity, user_id, total_cost)
+                payment_data = pending_payments.get(invoice_id) or {}
+                order_id = payment_data.get("order_id")
+                async with payment_finalize_lock:
+                    if invoice_id not in pending_payments:
+                        return
+                    items = (
+                        await buy_cart_with_transaction(
+                            cart_items, user_id, total_cost, order_id=order_id,
+                            payment_method=provider,
+                        )
+                        if cart_items else
+                        await buy_items_with_transaction(
+                            cat_id, quantity, user_id, total_cost, order_id=order_id,
+                            payment_method=provider,
+                        )
+                    )
+                    pending_payments.pop(invoice_id, None)
                 if not items:
+                    if order_id and await fetchone(
+                        "SELECT 1 FROM orders WHERE id = ? AND status IN ('paid', 'fulfilled')",
+                        (order_id,),
+                    ):
+                        pending_payments.pop(invoice_id, None)
+                        return
                     await get_active_bot().send_message(user_id, f'<tg-emoji emoji-id="{CustomEmoji.WARNING}">❌</tg-emoji> Товар закончился во время оплаты. Обратитесь в поддержку.', parse_mode="HTML")
-                    del pending_payments[invoice_id]
+                    pending_payments.pop(invoice_id, None)
                     return
                 res_text = f'<tg-emoji emoji-id="{CustomEmoji.PREORDER_CHECK}">✅</tg-emoji> Оплата подтверждена!\n\n<tg-emoji emoji-id="{CustomEmoji.PREORDER_BOX}">🎁</tg-emoji> Ваш товар:\n'
                 for _, i_data in items:
@@ -1434,26 +1911,32 @@ async def auto_check_payment(invoice_id, user_id: int, cat_id: int, quantity: in
                     user_id,
                     res_text,
                     parse_mode="Markdown",
-                    reply_markup=purchase_review_keyboard(cat_id).as_markup(),
+                    reply_markup=(
+                        purchase_review_keyboard(cat_id).as_markup()
+                        if cat_id is not None else None
+                    ),
                 )
-                try:
-                    await msg_to_edit.delete()
-                except Exception:
-                    pass
+                if msg_to_edit:
+                    try:
+                        await msg_to_edit.delete()
+                    except Exception:
+                        pass
                 referrer = await fetchone("SELECT referrer_id FROM users WHERE id = ?", (user_id,))
                 if referrer and referrer[0]:
                     ref_bonus = round(total_cost * 0.1, 2)
                     await add_referral_earning(referrer[0], ref_bonus, user_id)
                     await get_active_bot().send_message(referrer[0], f'<tg-emoji emoji-id="{CustomEmoji.MONEY}">💰</tg-emoji> Вы получили {ref_bonus} USDT (10%) от покупки!', parse_mode="HTML")
-                del pending_payments[invoice_id]
+                pending_payments.pop(invoice_id, None)
                 return
             elif is_expired:
-                await msg_to_edit.edit_text(f'<tg-emoji emoji-id="{CustomEmoji.WARNING}">❌</tg-emoji> Счет просрочен. Создайте новый заказ.', parse_mode="HTML")
-                del pending_payments[invoice_id]
+                if msg_to_edit:
+                    await msg_to_edit.edit_text(f'<tg-emoji emoji-id="{CustomEmoji.WARNING}">❌</tg-emoji> Счет просрочен. Создайте новый заказ.', parse_mode="HTML")
+                pending_payments.pop(invoice_id, None)
                 return
         if invoice_id in pending_payments:
-            await msg_to_edit.edit_text(f'<tg-emoji emoji-id="{CustomEmoji.WARNING}">❌</tg-emoji> Время автоматической проверки истекло. Обратитесь в поддержку.', parse_mode="HTML")
-            del pending_payments[invoice_id]
+            if msg_to_edit:
+                await msg_to_edit.edit_text(f'<tg-emoji emoji-id="{CustomEmoji.WARNING}">❌</tg-emoji> Время автоматической проверки истекло. Обратитесь в поддержку.', parse_mode="HTML")
+            pending_payments.pop(invoice_id, None)
 
 # --- ФОНОВАЯ ЗАДАЧА ---
 async def cleanup_old_payments():
@@ -1528,7 +2011,7 @@ async def show_categories_group(call: types.CallbackQuery, group_key: str):
 async def inline_handler(query: InlineQuery):
     user_id = query.from_user.id
 
-    ref_link = f"https://t.me/{(await get_active_bot().get_me()).username}?start=ref_{user_id}"
+    ref_link = f"https://t.me/{REFERRAL_BOT_USERNAME}?start=ref_{user_id}"
 
     kb = InlineKeyboardBuilder()
     kb.button(text="Запуск", url=ref_link, icon_custom_emoji_id="START", style="success")
@@ -1583,21 +2066,6 @@ async def show_quantity_keyboard(message: types.Message, cid: int, cat_name: str
 # ОБРАБОТЧИКИ СООБЩЕНИЙ
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@dp.message(F.text == "Ассортимент")
-async def text_catalog(message: types.Message, state: FSMContext):
-    await state.clear()
-    kb = InlineKeyboardBuilder()
-    kb.button(text="Госуслуги 1960-2008R",callback_data="group_gy",icon_custom_emoji_id=CustomEmoji.GY,style="SUCCESS")
-    kb.button(text="ТБанк", callback_data="group_tbank", icon_custom_emoji_id=CustomEmoji.TBANK, style="SUCCESS")
-    kb.button(text="Логи 1952-2008R", callback_data="group_l0gu", icon_custom_emoji_id="5312126452043363774", style="SUCCESS")
-    kb.adjust(1)
-    text = (
-        '<b><tg-emoji emoji-id="4924866615515809418">❓</tg-emoji> Ассортимент товаров</b>\n\n'
-        '<blockquote><b><tg-emoji emoji-id="5213359409874377109">❓</tg-emoji> '
-        'Выберите интересующий вас раздел:</b></blockquote>'
-    )
-    await send_with_image(message, 'AlteraStore', text, kb.as_markup())
-
 @dp.message(F.text == "Профиль")
 async def text_profile(message: types.Message, state: FSMContext):
     await state.clear()
@@ -1609,13 +2077,19 @@ async def text_deposit(message: types.Message, state: FSMContext):
     await state.set_state(ShopState.waiting_for_deposit_provider)
     kb = InlineKeyboardBuilder()
     kb.button(text="@xRocket", callback_data="deposit_provider_xrocket", icon_custom_emoji_id=CustomEmoji.XROCKET_PAY, style='primary')
+    kb.button(text="@CryptoBot", callback_data="deposit_provider_cryptobot", icon_custom_emoji_id=CustomEmoji.CRYPTOBOT_PAY, style='primary')
     kb.button(text="Telegram Stars", callback_data="deposit_provider_stars", icon_custom_emoji_id="5213085536989780516", style='primary')
     kb.adjust(1)
     text = '<b><tg-emoji emoji-id="4924714844256470686">💰</tg-emoji> Пополнение баланса ALTERA</b>\n\n<blockquote><b><tg-emoji emoji-id="5213359409874377109">❓</tg-emoji> Выберите удобный для Вас способ оплаты:</b></blockquote>'
     await send_with_image(message, 'EleghantBalance', text, kb.as_markup())
 
 @dp.message(F.text == "FAQ")
-async def text_faq(message: types.Message, user_id: Optional[int] = None, state: FSMContext = None):
+async def text_faq(
+    message: types.Message,
+    user_id: Optional[int] = None,
+    state: FSMContext = None,
+    onboarding: bool = False,
+):
     if state is not None:
         await state.clear()
     user_id = user_id or message.from_user.id
@@ -1635,15 +2109,30 @@ async def text_faq(message: types.Message, user_id: Optional[int] = None, state:
             text=text,
             callback_data=key,
             icon_custom_emoji_id=emoji_id,
-            style="success" if key in completed_keys else "danger"
+            style="primary" if key in completed_keys else "danger"
         )
     kb.adjust(1)
     progress = len(completed_keys.intersection(FAQ_KEYS))
-    footer = (
-        f'<blockquote><b><tg-emoji emoji-id="5215194567795575965">📖</tg-emoji> Прочитано: {progress} из {len(FAQ_KEYS)}</b></blockquote>'
-        if progress < len(FAQ_KEYS)
-        else "<blockquote><b>Выберите вопрос:</b></blockquote>"
-    )
+    if progress < len(FAQ_KEYS):
+        footer = (
+            f'<blockquote><b><tg-emoji emoji-id="5215194567795575965">📖</tg-emoji> '
+            f'Прочитано: {progress} из {len(FAQ_KEYS)}</b></blockquote>'
+        )
+    else:
+        footer = (
+            "<blockquote><b>Все разделы FAQ прочитаны. Нажмите «Далее» для продолжения."
+            "</b></blockquote>"
+            if onboarding
+            else "<blockquote><b>Выберите вопрос:</b></blockquote>"
+        )
+        if onboarding:
+            kb.button(
+                text="Далее",
+                callback_data="onboarding_agreement",
+                icon_custom_emoji_id="4927376474144507529",
+                style="success",
+            )
+            kb.adjust(1)
     await message.answer(
         f'<tg-emoji emoji-id="5212948901195190028">⭐️</tg-emoji> '
         '<b>FAQ</b> — раздел с ответами на наиболее распространённые вопросы пользователей. '
@@ -1665,7 +2154,7 @@ async def show_required_faq(message: types.Message):
         "<b>Перед использованием бота ознакомьтесь со всеми пунктами FAQ.</b>",
         parse_mode="HTML"
     )
-    await text_faq(message)
+    await text_faq(message, onboarding=True)
 
 async def show_agreement(message: types.Message):
     kb = InlineKeyboardBuilder()
@@ -1828,27 +2317,13 @@ async def faq_item_cb(call: types.CallbackQuery):
         await call.answer("❌ Раздел FAQ не найден", show_alert=True)
         return
     kb = InlineKeyboardBuilder()
-    kb.button(text="Назад", callback_data="back_to_faq", icon_custom_emoji_id=CustomEmoji.BACK, style="danger")
+    kb.button(text="Назад", callback_data="back_to_faq", icon_custom_emoji_id=CustomEmoji.BACK, style="primary")
     if faq_key in FAQ_KEYS:
         await execute_query(
             "INSERT OR IGNORE INTO faq_progress (user_id, faq_key, completed_at) VALUES (?, ?, ?)",
             (call.from_user.id, faq_key, datetime.now(timezone.utc).isoformat()),
             commit=True
         )
-        if await faq_access_granted(call.from_user.id):
-            registration = await fetchone(
-                "SELECT accepted, privacy_accepted FROM users WHERE id = ?",
-                (call.from_user.id,),
-            )
-            await call.message.delete()
-            if not registration or not registration[0]:
-                await show_agreement(call.message)
-            elif registration[1] != 1:
-                await show_privacy_policy(call.message)
-            else:
-                await show_main_menu(call.message)
-            await call.answer()
-            return
     await call.message.edit_text(
         answers[faq_key],
         parse_mode="HTML",
@@ -2260,6 +2735,7 @@ async def preorder_quantity_msg(message: types.Message, state: FSMContext):
     await state.set_state(ShopState.waiting_for_preorder_provider)
     kb = InlineKeyboardBuilder()
     kb.button(text="Оплатить @xRocket", callback_data="preorder_pay_xrocket", icon_custom_emoji_id=CustomEmoji.XROCKET_PAY, style='primary')
+    kb.button(text="Оплатить @CryptoBot", callback_data="preorder_pay_cryptobot", style='primary')
     kb.adjust(1)
     await message.answer(
         f'<tg-emoji emoji-id="{CustomEmoji.PREORDER_BOX}">📦</tg-emoji> {cat_name} x{qty}\n'
@@ -2268,9 +2744,12 @@ async def preorder_quantity_msg(message: types.Message, state: FSMContext):
         reply_markup=kb.as_markup(), parse_mode="HTML"
     )
 
-@dp.callback_query(F.data == "preorder_pay_xrocket", ShopState.waiting_for_preorder_provider)
+@dp.callback_query(
+    F.data.in_({"preorder_pay_xrocket", "preorder_pay_cryptobot"}),
+    ShopState.waiting_for_preorder_provider,
+)
 async def preorder_pay_provider_cb(call: types.CallbackQuery, state: FSMContext):
-    provider = "xrocket"
+    provider = "xrocket" if call.data == "preorder_pay_xrocket" else "cryptobot"
     data = await state.get_data()
     cat_id = data['preorder_cat_id']
     cat_name = data['preorder_cat_name']
@@ -2289,13 +2768,27 @@ async def preorder_pay_provider_cb(call: types.CallbackQuery, state: FSMContext)
 
     if provider == "xrocket":
         inv = await xrocket_create_invoice(amount=total, description=f"Предзаказ: {cat_name} x{qty}", expired_in=3600)
-        if not inv.get('ok'):
-            await call.message.answer(f"⚠ Ошибка API xRocket: {inv.get('description', 'Неизвестная ошибка')}")
-            await state.clear()
-            await call.answer()
-            return
-        invoice_id = inv['id']
-        pay_url = inv['link']
+    else:
+        inv = await cryptobot_create_invoice(
+            amount=total,
+            description=f"Предзаказ ALTERA: {cat_name} x{qty}",
+            payload=json.dumps({"type": "preorder", "user_id": user_id}, separators=(",", ":")),
+            expires_in=3600,
+        )
+    if not inv.get('ok'):
+        if preorder_id:
+            await execute_query(
+                "UPDATE preorders SET status = 'failed' WHERE id = ?",
+                (preorder_id,),
+                commit=True,
+            )
+        await call.message.answer(f"⚠ Не удалось создать счёт: {inv.get('description', 'ошибка платёжного сервиса')}")
+        await state.clear()
+        await call.answer()
+        return
+    invoice_id = str(inv['id'])
+    pay_url = inv['link']
+    if provider == "xrocket":
         provider_emoji = CustomEmoji.XROCKET_PAY
     pending_payments[invoice_id] = {
         'user_id': user_id, 'cat_id': cat_id, 'quantity': qty,
@@ -2303,7 +2796,10 @@ async def preorder_pay_provider_cb(call: types.CallbackQuery, state: FSMContext)
         'preorder_id': preorder_id, 'provider': provider
     }
     kb = InlineKeyboardBuilder()
-    kb.button(text="Оплатить предзаказ", url=pay_url, icon_custom_emoji_id=provider_emoji, style='success')
+    if provider == "xrocket":
+        kb.button(text="Оплатить предзаказ", url=pay_url, icon_custom_emoji_id=provider_emoji, style='success')
+    else:
+        kb.button(text="Оплатить через CryptoBot", url=pay_url, icon_custom_emoji_id=CustomEmoji.CRYPTOBOT_PAY, style='success')
     kb.button(text="Проверить оплату", callback_data=f"check_payment_{invoice_id}", style='primary', icon_custom_emoji_id=CustomEmoji.CHECKPAY)
     kb.adjust(1)
     msg = await call.message.answer(
@@ -2327,17 +2823,22 @@ async def auto_check_preorder_payment(invoice_id, user_id: int, cat_id: int, qua
             await asyncio.sleep(PAYMENT_CHECK_INTERVAL)
             if invoice_id not in pending_payments:
                 return
-            if provider == "xrocket":
-                inv = await xrocket_get_invoice(str(invoice_id))
-                if not inv.get('ok'):
-                    continue
-                is_paid = _xrocket_is_paid(inv.get('status'), inv.get('paid_amount'))
-                is_expired = _xrocket_is_expired(inv.get('status'))
+            inv = await get_provider_invoice(provider, str(invoice_id))
+            if not inv.get("ok"):
+                continue
+            is_paid = provider_invoice_is_paid(provider, inv)
+            is_expired = provider_invoice_is_expired(provider, inv)
             if is_paid:
-                if preorder_id:
-                    await execute_query("UPDATE preorders SET status = 'paid', paid_at = ? WHERE id = ?",
-                                      (datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), preorder_id), commit=True)
-                del pending_payments[invoice_id]
+                async with payment_finalize_lock:
+                    if invoice_id not in pending_payments:
+                        return
+                    if preorder_id:
+                        await execute_query(
+                            "UPDATE preorders SET status = 'paid', paid_at = ? WHERE id = ?",
+                            (datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), preorder_id),
+                            commit=True,
+                        )
+                    pending_payments.pop(invoice_id, None)
                 await get_active_bot().send_message(user_id,
                     f'<tg-emoji emoji-id="{CustomEmoji.PREORDER_CHECK}">✅</tg-emoji> <b>Предзаказ оплачен!</b>\n\n'
                     f'<tg-emoji emoji-id="{CustomEmoji.PREORDER_BOX}">📦</tg-emoji> Товар: {cat_name}\n'
@@ -2354,13 +2855,13 @@ async def auto_check_preorder_payment(invoice_id, user_id: int, cat_id: int, qua
                 if preorder_id:
                     await execute_query("UPDATE preorders SET status = 'expired' WHERE id = ?", (preorder_id,), commit=True)
                 await msg_to_edit.edit_text(f'<tg-emoji emoji-id="{CustomEmoji.WARNING}">❌</tg-emoji> Счет просрочен.', parse_mode="HTML")
-                del pending_payments[invoice_id]
+                pending_payments.pop(invoice_id, None)
                 return
         if invoice_id in pending_payments:
             if preorder_id:
                 await execute_query("UPDATE preorders SET status = 'expired' WHERE id = ?", (preorder_id,), commit=True)
             await msg_to_edit.edit_text(f'<tg-emoji emoji-id="{CustomEmoji.WARNING}">❌</tg-emoji> Время ожидания истекло.', parse_mode="HTML")
-            del pending_payments[invoice_id]
+            pending_payments.pop(invoice_id, None)
 
 @dp.callback_query(F.data == "cancel_preorder")
 async def cancel_preorder_cb(call: types.CallbackQuery, state: FSMContext):
@@ -2568,6 +3069,10 @@ async def cancel_payment_cb(call: types.CallbackQuery):
         pending_payments.pop(int(invoice_id), None)
     except ValueError:
         pass
+    if payment_data.get("cat_id") is None:
+        await call.message.edit_text("❌ Заказ корзины отменён.")
+        await call.answer()
+        return
     category_call = call.model_copy(update={"data": f"view_{cat_id}"})
     await view_cat_cb(category_call)
 
@@ -2577,6 +3082,7 @@ async def confirm_purchase_cb(call: types.CallbackQuery, state: FSMContext):
     balance = await get_balance(call.from_user.id)
     kb = InlineKeyboardBuilder()
     kb.button(text="@xRocket", callback_data="pay_xrocket", icon_custom_emoji_id=CustomEmoji.XROCKET_PAY, style='primary')
+    kb.button(text="@CryptoBot", callback_data="pay_cryptobot", icon_custom_emoji_id=CustomEmoji.CRYPTOBOT_PAY, style='primary')
     kb.button(text="Telegram Stars", callback_data="pay_stars", icon_custom_emoji_id="5213085536989780516", style='primary')
     kb.button(text="Баланс", callback_data="pay_balance", icon_custom_emoji_id="4925106025582823166", style='primary')
     kb.button(text="Отменить заказ", callback_data=f"cancel_purchase_{data['cid']}", icon_custom_emoji_id="5215248628548931525", style='danger')
@@ -2648,6 +3154,65 @@ async def pay_xrocket_cb(call: types.CallbackQuery, state: FSMContext):
     )
     pending_payments[invoice_id]['msg'] = msg
     asyncio.create_task(auto_check_payment(invoice_id, user_id, cid, quantity, msg, total, 'xrocket'))
+    await state.clear()
+    await call.answer()
+
+@dp.callback_query(F.data == "pay_cryptobot")
+async def pay_cryptobot_cb(call: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    try:
+        cat_id = int(data["cid"])
+        quantity = int(data["quantity"])
+        total = round(float(data["total"]), 2)
+        cat_name = str(data["cat_name"])
+    except (KeyError, TypeError, ValueError):
+        await call.answer("Данные заказа устарели. Оформите покупку заново.", show_alert=True)
+        await state.clear()
+        return
+    user_id = call.from_user.id
+    invoice = await cryptobot_create_invoice(
+        amount=total,
+        description=f"Покупка ALTERA: {cat_name} x{quantity}",
+        payload=json.dumps(
+            {"type": "purchase", "user_id": user_id, "cat_id": cat_id, "quantity": quantity},
+            separators=(",", ":"),
+        ),
+        expires_in=1800,
+    )
+    if not invoice.get("ok"):
+        await call.message.answer(f"⚠ Не удалось создать счёт: {invoice.get('description', 'ошибка CryptoBot Pay')}")
+        await state.clear()
+        await call.answer()
+        return
+    invoice_id = str(invoice["id"])
+    pending_payments[invoice_id] = {
+        "user_id": user_id,
+        "cat_id": cat_id,
+        "quantity": quantity,
+        "total": total,
+        "created_at": datetime.now(timezone.utc),
+        "is_preorder": False,
+        "provider": "cryptobot",
+    }
+    keyboard = InlineKeyboardBuilder()
+    keyboard.button(text="Оплатить через CryptoBot", url=invoice["link"], icon_custom_emoji_id=CustomEmoji.CRYPTOBOT_PAY, style="success")
+    keyboard.button(
+        text="Проверить оплату",
+        callback_data=f"check_payment_{invoice_id}",
+        icon_custom_emoji_id=CustomEmoji.CHECKPAY,
+        style="primary",
+    )
+    keyboard.adjust(1)
+    message = await call.message.answer(
+        f"📦 {cat_name} — {quantity} шт.\n"
+        f"💰 Сумма: {total:.2f} USDT\n"
+        "⏳ Счёт действителен 30 минут\n\nНажмите кнопку ниже для оплаты:",
+        reply_markup=keyboard.as_markup(),
+    )
+    pending_payments[invoice_id]["msg"] = message
+    asyncio.create_task(
+        auto_check_payment(invoice_id, user_id, cat_id, quantity, message, total, "cryptobot")
+    )
     await state.clear()
     await call.answer()
 
@@ -2732,12 +3297,9 @@ async def show_profile_with_image(user_id: int, target_message: types.Message):
         "</b>"
     )
     kb = InlineKeyboardBuilder()
+    kb.button(text="Пополнить баланс", callback_data="profile_deposit", icon_custom_emoji_id="4925106025582823166", style='primary')
     kb.button(text="История покупок", callback_data="profile_history", icon_custom_emoji_id=CustomEmoji.PURCHASE_HISTORY, style='primary')
-    kb.button(text="Оставить отзыв", callback_data="profile_reviews", icon_custom_emoji_id=CustomEmoji.REVIEW, style='primary')
-    kb.button(text="Реферальная ссылка", callback_data="profile_referral", icon_custom_emoji_id=CustomEmoji.REFERRAL, style='primary')
-    kb.button(text="Активировать промокод", callback_data="profile_promo", icon_custom_emoji_id=CustomEmoji.PROMO_CODE, style='primary')
     kb.button(text="Создать свое зеркало", callback_data="profile_mirror", icon_custom_emoji_id=CustomEmoji.CREATE_MIRROR, style='primary')
-    kb.button(text="Вывод с реф. баланса", callback_data="profile_withdraw", icon_custom_emoji_id=CustomEmoji.REF_WITHDRAW, style='primary')
     kb.adjust(1)
     await send_with_image(target_message, 'EleghantProfile', text, kb.as_markup())
 
@@ -2873,14 +3435,25 @@ async def profile_mirror_cb(call: types.CallbackQuery, state: FSMContext):
     kb.button(text="Назад к профилю", callback_data="back_to_profile", icon_custom_emoji_id=CustomEmoji.BACK, style="danger")
     await call.message.answer(
         '<b><tg-emoji emoji-id="5213464610803323563">🔗</tg-emoji> Создание зеркала</b>\n\n'
-        "<blockquote>Создайте бота через @BotFather и отправьте сюда его токен. "
-        "Токен нужен только для подключения зеркала, никому его не пересылайте.</blockquote>",
+        "<blockquote><b>Создайте бота через @BotFather и отправьте сюда его токен. "
+        "Токен нужен только для подключения зеркала, никому его не пересылайте.</b></blockquote>",
         parse_mode="HTML", reply_markup=kb.as_markup()
     )
     await call.answer()
 
 @dp.message(ShopState.waiting_for_mirror_token)
 async def mirror_token_msg(message: types.Message, state: FSMContext):
+    if message.text in {"Профиль", "FAQ", "Поддержка", "Открыть в WebApp"}:
+        await state.clear()
+        if message.text == "Профиль":
+            await text_profile(message, state)
+        elif message.text == "FAQ":
+            await text_faq(message, state=state)
+        elif message.text == "Поддержка":
+            await text_help(message, state)
+        else:
+            await text_open_webapp(message)
+        return
     token = (message.text or "").strip()
     if len(token) < 20 or ":" not in token:
         await message.answer("❌ Похоже, это не токен Telegram-бота. Отправьте токен из @BotFather.")
@@ -2937,23 +3510,8 @@ async def mirror_token_msg(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data == "profile_withdraw")
 async def profile_withdraw_cb(call: types.CallbackQuery, state: FSMContext):
-    user_id = call.from_user.id
-    balance = await get_balance(user_id)
-    await state.set_state(ShopState.waiting_for_withdraw_amount)
-    kb = InlineKeyboardBuilder()
-    kb.button(text="Назад к профилю", callback_data="back_to_profile", icon_custom_emoji_id=CustomEmoji.BACK, style="danger")
-    kb.adjust(1)
-    await call.message.answer(
-        '<b><tg-emoji emoji-id="4924714844256470686">❓</tg-emoji> Вывод средств с реферального баланса</b>\n\n'
-        '<blockquote><b><tg-emoji emoji-id="4924694584895735802">❓</tg-emoji> '
-        'Производим выводы на такие сервисы как: @xRocket; По адресу кошелька.</b></blockquote>\n\n'
-        f'<blockquote><b><tg-emoji emoji-id="4927470722906850798">🔒</tg-emoji> Ваш баланс: {balance} USDT</b></blockquote>\n\n'
-        '<b><tg-emoji emoji-id="5213067717170466441">❓</tg-emoji> '
-        'Введите сумму для вывода (минимальная сумма для вывода 1$):</b>',
-        parse_mode="HTML",
-        reply_markup=kb.as_markup()
-    )
-    await call.answer()
+    await state.clear()
+    await call.answer("Вывод средств отключён.", show_alert=True)
 
 @dp.message(ShopState.waiting_for_withdraw_amount)
 async def withdraw_amount_msg(message: types.Message, state: FSMContext):
@@ -3338,6 +3896,11 @@ async def show_history(message: types.Message, user_id: int, period: str):
 
 
 # Обработчик для кнопки "История покупок" – с правильным декоратором
+@dp.callback_query(F.data == "profile_deposit")
+async def profile_deposit_cb(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
+    await text_deposit(call.message, state)
+
 @dp.callback_query(F.data == "profile_history")
 async def profile_history_cb(call: types.CallbackQuery):
     await show_history(call.message, call.from_user.id, "all")
@@ -3353,10 +3916,7 @@ async def history_period_cb(call: types.CallbackQuery):
 async def profile_referral_cb(call: types.CallbackQuery):
     user_id = call.from_user.id
     ref_count, ref_earn = await get_referral_info(user_id)
-    bot_info = await get_active_bot().get_me()
-    
-    bot_username = bot_info.username.replace("@", "")
-    link = f"https://t.me/{bot_username}?start=ref_{user_id}"
+    link = f"https://t.me/{REFERRAL_BOT_USERNAME}?start=ref_{user_id}"
     share_text = "Заходи в крутого бота по моей ссылке! Нам обоим дадут бонусы 🎁"
     
     text = (
@@ -3459,10 +4019,16 @@ async def promo_code_activate(message: types.Message, state: FSMContext):
     await state.clear()
 
 # --- ПОПОЛНЕНИЕ БАЛАНСА ---
-@dp.callback_query(F.data.in_({"deposit_provider_xrocket", "deposit_provider_stars"}))
+@dp.callback_query(
+    F.data.in_({"deposit_provider_xrocket", "deposit_provider_cryptobot", "deposit_provider_stars"})
+)
 async def deposit_provider_cb(call: types.CallbackQuery, state: FSMContext):
-    provider = "xrocket" if call.data == "deposit_provider_xrocket" else "stars"
-    provider_name = {"xrocket": "@xRocket", "stars": "Telegram Stars"}[provider]
+    provider = {
+        "deposit_provider_xrocket": "xrocket",
+        "deposit_provider_cryptobot": "cryptobot",
+        "deposit_provider_stars": "stars",
+    }[call.data]
+    provider_name = {"xrocket": "@xRocket", "cryptobot": "@CryptoBot", "stars": "Telegram Stars"}[provider]
     await state.update_data(deposit_provider=provider)
     await state.set_state(ShopState.waiting_for_deposit_amount)
     stars_hint = (
@@ -3480,6 +4046,17 @@ async def deposit_provider_cb(call: types.CallbackQuery, state: FSMContext):
 
 @dp.message(ShopState.waiting_for_deposit_amount)
 async def deposit_amount(message: types.Message, state: FSMContext):
+    if message.text in {"Профиль", "FAQ", "Поддержка", "Открыть в WebApp"}:
+        await state.clear()
+        if message.text == "Профиль":
+            await text_profile(message, state)
+        elif message.text == "FAQ":
+            await text_faq(message, state=state)
+        elif message.text == "Поддержка":
+            await text_help(message, state)
+        else:
+            await text_open_webapp(message)
+        return
     try:
         amount = float(message.text.replace(',', '.'))
         if amount < 1 or amount > 10000:
@@ -3489,9 +4066,10 @@ async def deposit_amount(message: types.Message, state: FSMContext):
         return await message.answer("❌ Введите число.")
     data = await state.get_data()
     provider = data.get('deposit_provider')
-    if provider not in {"xrocket", "stars"}:
+    if provider not in {"xrocket", "cryptobot", "stars"}:
         await message.answer("❌ Способ оплаты не выбран. Откройте пополнение баланса заново.")
         await state.clear()
+        return
     if provider == "stars":
         stars = max(1, int(round(amount * STAR_USDT_RATE)))
         await message.answer_invoice(
@@ -3509,19 +4087,28 @@ async def deposit_amount(message: types.Message, state: FSMContext):
             description=f"Пополнение баланса пользователя {message.from_user.id}",
             expired_in=1800
         )
-        if not inv.get('ok'):
-            await message.answer(f"⚠ Ошибка API xRocket: {inv.get('description', 'Неизвестная ошибка')}")
-            await state.clear()
-            return
-        invoice_id = inv['id']
-        pay_url = inv['link']
-        provider_emoji = CustomEmoji.XROCKET_PAY
+    else:
+        inv = await cryptobot_create_invoice(
+            amount=amount,
+            description=f"Пополнение ALTERA пользователем {message.from_user.id}",
+            payload=json.dumps({"type": "deposit", "user_id": message.from_user.id}, separators=(",", ":")),
+            expires_in=1800,
+        )
+    if not inv.get('ok'):
+        await message.answer(f"⚠ Не удалось создать счёт: {inv.get('description', 'ошибка платёжного сервиса')}")
+        await state.clear()
+        return
+    invoice_id = str(inv['id'])
+    pay_url = inv['link']
     pending_balance_payments[invoice_id] = {
         'user_id': message.from_user.id, 'amount': amount,
         'created_at': datetime.now(), 'provider': provider
     }
     kb = InlineKeyboardBuilder()
-    kb.button(text="Оплатить", url=pay_url, icon_custom_emoji_id=provider_emoji, style='success')
+    if provider == "xrocket":
+        kb.button(text="Оплатить", url=pay_url, icon_custom_emoji_id=CustomEmoji.XROCKET_PAY, style='success')
+    else:
+        kb.button(text="Оплатить через CryptoBot", url=pay_url, icon_custom_emoji_id=CustomEmoji.CRYPTOBOT_PAY, style='success')
     kb.button(text="Проверить оплату", callback_data=f"check_balance_payment_{invoice_id}", style='primary', icon_custom_emoji_id=CustomEmoji.CHECKPAY)
     kb.button(text="Отменить пополнение", callback_data=f"cancel_balance_payment_{invoice_id}", icon_custom_emoji_id="5215248628548931525", style='danger')
     kb.adjust(1)
@@ -3584,24 +4171,430 @@ async def cmd_create_invoice(message: types.Message):
     pending_balance_payments[invoice_id]["msg"] = msg
     asyncio.create_task(check_deposit_payment(invoice_id, message.from_user.id, amount, msg))
 
-@dp.message(Command("webapp"))
-async def cmd_open_webapp(message: types.Message):
+async def send_webapp_entry(message: types.Message):
     if not WEB_APP_URL:
         await message.answer(
             "Web App ещё не настроен. Укажите переменную ALTERA_WEB_APP_URL с HTTPS-адресом."
         )
         return
     kb = InlineKeyboardBuilder()
-    kb.button(text="Открыть каталог", web_app=WebAppInfo(url=WEB_APP_URL), style="success")
-    await message.answer("Откройте каталог ALTERA:", reply_markup=kb.as_markup())
+    kb.button(
+        text="Войти в Mini App",
+        web_app=WebAppInfo(url=WEB_APP_URL),
+        icon_custom_emoji_id="5213338489088677310",
+        style="primary",
+    )
+    await message.answer(
+        '<b><tg-emoji emoji-id="5213320879722763618">❓</tg-emoji> Чем полезен наш MiniApp:</b>\n\n'
+        '<blockquote><b>'
+        '1. <b>Каталог товаров</b> — поиск, категории, фильтры, сортировка и подробные карточки товаров.\n'
+        '2. <b>Корзина и покупки</b> — добавление товаров, изменение количества и оформление заказа.\n'
+        '3. <b>Оплата</b> — через внутренний баланс, xRocket, CryptoBot и Telegram Stars.\n'
+        '4. <b>Профиль пользователя</b> — аватар, баланс, пополнение, статистика и реферальная программа.\n'
+        '5. <b>Избранное и история</b> — сохранение товаров, уведомления о наличии/снижении цены, отзывы и повторный просмотр покупок.'
+        '</b></blockquote>\n\n'
+        '<b><tg-emoji emoji-id="5212929350504061392">⭐</tg-emoji> Откройте Mini App ALTERA кнопкой ниже:</b>',
+        parse_mode="HTML",
+        reply_markup=kb.as_markup(),
+    )
+
+@dp.message(Command("webapp"))
+async def cmd_open_webapp(message: types.Message):
+    await send_webapp_entry(message)
+
+@dp.message(F.text == "Открыть в WebApp")
+async def text_open_webapp(message: types.Message):
+    await send_webapp_entry(message)
+
+def _telegram_webapp_user(
+    init_data: str, bot_tokens: List[str],
+) -> Tuple[Optional[dict], Optional[str]]:
+    """Validate Telegram Web App initData and return its user object."""
+    if not init_data:
+        logger.warning("Telegram Mini App authorization rejected: init_data_missing")
+        return None, "init_data_missing"
+    if len(init_data) > 8192:
+        logger.warning("Telegram Mini App authorization rejected: init_data_too_large")
+        return None, "init_data_too_large"
+    try:
+        pairs = parse_qsl(init_data, keep_blank_values=True, strict_parsing=True)
+        if len({key for key, _ in pairs}) != len(pairs):
+            logger.warning("Telegram Mini App authorization rejected: duplicate_fields")
+            return None, "duplicate_fields"
+        values = dict(pairs)
+        received_hash = values.pop("hash", "")
+        if not received_hash or len(received_hash) != 64:
+            logger.warning("Telegram Mini App authorization rejected: invalid_hash_format")
+            return None, "invalid_hash_format"
+        data_check_string = "\n".join(
+            f"{key}={value}" for key, value in sorted(values.items())
+        )
+        matched_bot = None
+        for bot_token in dict.fromkeys(token for token in bot_tokens if token):
+            secret_key = hmac.new(
+                b"WebAppData", bot_token.encode("utf-8"), hashlib.sha256
+            ).digest()
+            calculated_hash = hmac.new(
+                secret_key, data_check_string.encode("utf-8"), hashlib.sha256
+            ).hexdigest()
+            if hmac.compare_digest(calculated_hash, received_hash):
+                matched_bot = bot_token
+                break
+        if matched_bot is None:
+            accepted_bot_ids = [
+                token.partition(":")[0]
+                for token in dict.fromkeys(token for token in bot_tokens if token)
+            ]
+            logger.warning(
+                "Telegram Mini App authorization rejected: signature_mismatch "
+                "(configured_bot_ids=%s)",
+                ",".join(accepted_bot_ids) or "none",
+            )
+            return None, "signature_mismatch"
+        auth_date = int(values.get("auth_date", "0"))
+        now = int(time.time())
+        if auth_date <= 0 or auth_date > now + 60:
+            logger.warning("Telegram Mini App authorization rejected: invalid_auth_date")
+            return None, "invalid_auth_date"
+        if now - auth_date > WEB_APP_INIT_DATA_MAX_AGE:
+            logger.warning("Telegram Mini App authorization rejected: init_data_expired")
+            return None, "init_data_expired"
+        user = json.loads(values.get("user", "{}"))
+        user_id = int(user["id"])
+        return {
+            "id": user_id,
+            "username": user.get("username") or "",
+            "user": user,
+            "bot_id": matched_bot.partition(":")[0],
+        }, None
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+        logger.warning("Telegram Mini App authorization rejected: malformed_init_data")
+        return None, "malformed_init_data"
+
+def _webapp_telegram_user(request: web.Request) -> Tuple[Optional[dict], Optional[str]]:
+    init_data = request.headers.get("X-Telegram-Init-Data", "")
+    if not init_data:
+        init_data = request.query.get("initData", "")
+    trusted_bots = [bot, *mirror_bots.values()]
+    return _telegram_webapp_user(
+        init_data, [candidate.token for candidate in trusted_bots]
+    )
+
+def _recovery_phrase_hash(phrase: str) -> str:
+    return hashlib.sha256(
+        ("altera-recovery-v1:" + phrase).encode("utf-8")
+    ).hexdigest()
+
+async def webapp_account_status(request: web.Request) -> web.Response:
+    telegram_user, auth_error = _webapp_telegram_user(request)
+    if not telegram_user:
+        return _webapp_response({
+            "error": "Telegram authorization required",
+            "auth_error": auth_error or "authorization_failed",
+        }, 401)
+    link = await fetchone(
+        "SELECT account_id FROM account_telegram_links WHERE telegram_id = ?",
+        (telegram_user["id"],),
+    )
+    if not link:
+        return _webapp_response({"needs_choice": True})
+    recovery = await fetchone(
+        "SELECT 1 FROM account_recovery WHERE account_id = ?", (link[0],)
+    )
+    return _webapp_response({
+        "needs_choice": False,
+        "needs_backup": not bool(recovery),
+    })
+
+async def webapp_account_register(request: web.Request) -> web.Response:
+    telegram_user, auth_error = _webapp_telegram_user(request)
+    if not telegram_user:
+        return _webapp_response({
+            "error": "Telegram authorization required",
+            "auth_error": auth_error or "authorization_failed",
+        }, 401)
+    telegram_id = telegram_user["id"]
+    if await is_user_banned(telegram_id):
+        return _webapp_response({"error": "Аккаунт заблокирован."}, 403)
+    link = await fetchone(
+        "SELECT account_id FROM account_telegram_links WHERE telegram_id = ?",
+        (telegram_id,),
+    )
+    if link:
+        return _webapp_response({"error": "Telegram уже привязан к аккаунту."}, 409)
+
+    await save_user(telegram_user["username"], telegram_id)
+    conn = await transaction()
+    try:
+        await conn.execute(
+            "INSERT INTO account_telegram_links (telegram_id, account_id, linked_at) "
+            "VALUES (?, ?, ?)",
+            (telegram_id, telegram_id, datetime.now(timezone.utc).isoformat()),
+        )
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        logger.exception("Failed to register Mini App account for Telegram ID %s", telegram_id)
+        return _webapp_response({"error": "Не удалось создать аккаунт. Попробуйте ещё раз."}, 500)
+    return _webapp_response({"ok": True})
+
+async def webapp_recovery_start(request: web.Request) -> web.Response:
+    user = await _webapp_authenticated_user(request)
+    if not user:
+        return _webapp_response({
+            "error": "Telegram authorization required",
+            "auth_error": request.get("webapp_auth_error", "authorization_failed"),
+        }, 401)
+    if await is_user_banned(user["id"]):
+        return _webapp_response({"error": "Аккаунт заблокирован."}, 403)
+    existing = await fetchone(
+        "SELECT 1 FROM account_recovery WHERE account_id = ?", (user["id"],)
+    )
+    if existing:
+        return _webapp_response({"error": "Фраза восстановления уже настроена."}, 409)
+    for pending_telegram_id, pending_value in list(webapp_recovery_pending.items()):
+        if pending_value["expires_at"] < time.time():
+            webapp_recovery_pending.pop(pending_telegram_id, None)
+    pending = webapp_recovery_pending.get(user["telegram_id"])
+    if pending and pending["account_id"] == user["id"] and pending["expires_at"] >= time.time():
+        return _webapp_response({"phrase": pending["phrase"]})
+    mnemonic = Mnemonic("english")
+    phrase = mnemonic.generate(strength=128)
+    positions = sorted(secrets.SystemRandom().sample(range(12), 3))
+    webapp_recovery_pending[user["telegram_id"]] = {
+        "account_id": user["id"],
+        "phrase": phrase,
+        "positions": positions,
+        "expires_at": time.time() + 600,
+        "attempts": 0,
+    }
+    return _webapp_response({"phrase": phrase})
+
+async def webapp_recovery_challenge(request: web.Request) -> web.Response:
+    user = await _webapp_authenticated_user(request)
+    if not user:
+        return _webapp_response({
+            "error": "Telegram authorization required",
+            "auth_error": request.get("webapp_auth_error", "authorization_failed"),
+        }, 401)
+    if await is_user_banned(user["id"]):
+        return _webapp_response({"error": "Аккаунт заблокирован."}, 403)
+    pending = webapp_recovery_pending.get(user["telegram_id"])
+    if (
+        not pending or pending["account_id"] != user["id"]
+        or pending["expires_at"] < time.time()
+    ):
+        webapp_recovery_pending.pop(user["telegram_id"], None)
+        return _webapp_response({"error": "Сессия настройки истекла. Начните заново."}, 400)
+    return _webapp_response({
+        "positions": [position + 1 for position in pending["positions"]],
+    })
+
+async def webapp_recovery_confirm(request: web.Request) -> web.Response:
+    user = await _webapp_authenticated_user(request)
+    if not user:
+        return _webapp_response({
+            "error": "Telegram authorization required",
+            "auth_error": request.get("webapp_auth_error", "authorization_failed"),
+        }, 401)
+    if await is_user_banned(user["id"]):
+        return _webapp_response({"error": "Аккаунт заблокирован."}, 403)
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, ValueError, web.HTTPException):
+        return _webapp_response({"error": "Некорректный запрос."}, 400)
+    answers = payload.get("answers") if isinstance(payload, dict) else None
+    pending = webapp_recovery_pending.get(user["telegram_id"])
+    if (
+        not isinstance(answers, list) or len(answers) != 3 or not pending
+        or pending["account_id"] != user["id"] or pending["expires_at"] < time.time()
+    ):
+        webapp_recovery_pending.pop(user["telegram_id"], None)
+        return _webapp_response({"error": "Сессия настройки истекла. Начните заново."}, 400)
+    try:
+        supplied = {
+            int(answer["position"]): str(answer["word"]).strip().lower()
+            for answer in answers
+            if isinstance(answer, dict)
+        }
+    except (KeyError, TypeError, ValueError):
+        supplied = {}
+    positions = [position + 1 for position in pending["positions"]]
+    words = pending["phrase"].split()
+    if len(supplied) != 3 or any(
+        supplied.get(position) != words[position - 1] for position in positions
+    ):
+        pending["attempts"] += 1
+        if pending["attempts"] >= 5:
+            webapp_recovery_pending.pop(user["telegram_id"], None)
+            return _webapp_response({"error": "Слишком много ошибок. Начните настройку заново."}, 429)
+        return _webapp_response({"error": "Слова не совпали. Проверьте фразу и попробуйте снова."}, 400)
+
+    conn = await transaction()
+    try:
+        await conn.execute(
+            "INSERT INTO account_recovery (account_id, phrase_hash, created_at) VALUES (?, ?, ?)",
+            (
+                user["id"],
+                _recovery_phrase_hash(pending["phrase"]),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        logger.exception("Failed to store recovery phrase for account %s", user["id"])
+        return _webapp_response({"error": "Не удалось сохранить фразу. Попробуйте ещё раз."}, 500)
+    webapp_recovery_pending.pop(user["telegram_id"], None)
+    return _webapp_response({"ok": True})
+
+async def webapp_account_login(request: web.Request) -> web.Response:
+    telegram_user, auth_error = _webapp_telegram_user(request)
+    if not telegram_user:
+        return _webapp_response({
+            "error": "Telegram authorization required",
+            "auth_error": auth_error or "authorization_failed",
+        }, 401)
+    telegram_id = telegram_user["id"]
+    now = time.time()
+    conn = await transaction()
+    try:
+        attempts = await (await conn.execute(
+            "SELECT attempts, window_started FROM account_recovery_attempts WHERE telegram_id = ?",
+            (telegram_id,),
+        )).fetchone()
+        if attempts and now - attempts[1] < 900 and attempts[0] >= 10:
+            await conn.rollback()
+            return _webapp_response({"error": "Слишком много попыток. Попробуйте через 15 минут."}, 429)
+        if not attempts or now - attempts[1] >= 900:
+            await conn.execute(
+                "INSERT INTO account_recovery_attempts (telegram_id, attempts, window_started) "
+                "VALUES (?, 1, ?) ON CONFLICT(telegram_id) DO UPDATE SET attempts = 1, window_started = excluded.window_started",
+                (telegram_id, now),
+            )
+        else:
+            await conn.execute(
+                "UPDATE account_recovery_attempts SET attempts = attempts + 1 WHERE telegram_id = ?",
+                (telegram_id,),
+            )
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        logger.exception("Failed to update recovery attempts for Telegram ID %s", telegram_id)
+        return _webapp_response({"error": "Не удалось выполнить вход. Попробуйте ещё раз."}, 500)
+
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, ValueError, web.HTTPException):
+        return _webapp_response({"error": "Некорректный запрос."}, 400)
+    raw_phrase = payload.get("phrase") if isinstance(payload, dict) else None
+    if not isinstance(raw_phrase, str):
+        return _webapp_response({"error": "Введите 12 слов фразы восстановления."}, 400)
+    phrase = " ".join(raw_phrase.lower().split())
+    mnemonic = Mnemonic("english")
+    if len(phrase.split()) != 12 or not mnemonic.check(phrase):
+        return _webapp_response({"error": "Фраза восстановления неверна."}, 401)
+    recovery = await fetchone(
+        "SELECT account_id FROM account_recovery WHERE phrase_hash = ?",
+        (_recovery_phrase_hash(phrase),),
+    )
+    if not recovery:
+        return _webapp_response({"error": "Фраза восстановления неверна."}, 401)
+    account_id = recovery[0]
+    if await is_user_banned(account_id):
+        return _webapp_response({"error": "Аккаунт заблокирован."}, 403)
+    await save_user(telegram_user["username"], telegram_id)
+    conn = await transaction()
+    try:
+        linked = await (await conn.execute(
+            "SELECT account_id FROM account_telegram_links WHERE telegram_id = ?",
+            (telegram_id,),
+        )).fetchone()
+        if linked and linked[0] != account_id:
+            await conn.rollback()
+            return _webapp_response({"error": "Этот Telegram уже привязан к другому аккаунту."}, 409)
+        if not linked:
+            await conn.execute(
+                "INSERT INTO account_telegram_links (telegram_id, account_id, linked_at) "
+                "VALUES (?, ?, ?)",
+                (telegram_id, account_id, datetime.now(timezone.utc).isoformat()),
+            )
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        logger.exception("Failed to link Telegram ID %s to account %s", telegram_id, account_id)
+        return _webapp_response({"error": "Не удалось привязать Telegram. Попробуйте ещё раз."}, 500)
+    return _webapp_response({"ok": True})
+
+async def _webapp_authenticated_user(request: web.Request) -> Optional[dict]:
+    user, auth_error = _webapp_telegram_user(request)
+    if user:
+        telegram_id = user["id"]
+        link = await fetchone(
+            "SELECT account_id FROM account_telegram_links WHERE telegram_id = ?",
+            (telegram_id,),
+        )
+        if not link:
+            request["webapp_auth_error"] = "account_selection_required"
+            return None
+        await save_user(user["username"], telegram_id)
+        user["telegram_id"] = telegram_id
+        user["id"] = link[0]
+    else:
+        request["webapp_auth_error"] = auth_error or "authorization_failed"
+    return user
+
+def _webapp_response(data: dict, status: int = 200) -> web.Response:
+    response = web.json_response(data, status=status)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Telegram-Init-Data"
+    return response
+
+async def _send_favorite_notification(user_id: int, text: str):
+    try:
+        await get_active_bot().send_message(user_id, f"🔔 Избранное ALTERA\n\n{text}")
+    except Exception:
+        logger.exception("Favorite notification delivery failed for user %s", user_id)
 
 async def webapp_catalog(request: web.Request) -> web.Response:
+    user = await _webapp_authenticated_user(request)
     rows = await fetchall(
-        "SELECT c.id, c.name, c.desc, c.price, COUNT(i.id) "
+        "SELECT c.id, c.name, c.desc, c.price, c.cat_group, c.updated_at, COUNT(DISTINCT i.id), "
+        "COALESCE(AVG(r.rating), 0), COUNT(DISTINCT r.id) "
         "FROM categories c LEFT JOIN inventory i ON i.cat_id = c.id "
+        "LEFT JOIN reviews r ON r.cat_id = c.id "
         "WHERE c.maintenance = 0 GROUP BY c.id ORDER BY c.id"
     )
-    response = web.json_response({
+    favorite_ids = set()
+    if user:
+        favorite_ids = {
+            row[0] for row in await fetchall(
+                "SELECT cat_id FROM favorites WHERE user_id = ?", (user["id"],)
+            )
+        }
+        favorite_rows = await fetchall(
+            "SELECT f.cat_id, f.notify_price, f.notify_stock, f.last_price, f.last_stock, "
+            "c.name, c.price, COUNT(i.id) FROM favorites f "
+            "JOIN categories c ON c.id = f.cat_id LEFT JOIN inventory i ON i.cat_id = c.id "
+            "WHERE f.user_id = ? GROUP BY f.cat_id",
+            (user["id"],),
+        )
+        for favorite in favorite_rows:
+            cat_id, notify_price, notify_stock, last_price, last_stock, name, price, stock = favorite
+            if notify_price and last_price is not None and float(price) < float(last_price):
+                asyncio.create_task(_send_favorite_notification(
+                    user["telegram_id"], f"Цена на «{name}» снизилась: {float(last_price):.2f} → {float(price):.2f} USDT."
+                ))
+            if notify_stock and int(last_stock or 0) == 0 and int(stock or 0) > 0:
+                asyncio.create_task(_send_favorite_notification(
+                    user["telegram_id"], f"Товар «{name}» снова появился в наличии: {int(stock)} шт."
+                ))
+            await execute_query(
+                "UPDATE favorites SET last_price = ?, last_stock = ? WHERE user_id = ? AND cat_id = ?",
+                (float(price), int(stock or 0), user["id"], cat_id), commit=True,
+            )
+    return _webapp_response({
         "categories": [
             {
                 "id": row[0],
@@ -3613,23 +4606,1024 @@ async def webapp_catalog(request: web.Request) -> web.Response:
                     flags=re.IGNORECASE | re.DOTALL,
                 ).strip(),
                 "price": row[3] or 0,
-                "stock": row[4],
+                "group": row[4] or "other",
+                "updated_at": row[5],
+                "stock": row[6],
+                "rating": round(float(row[7] or 0), 1),
+                "reviews_count": int(row[8] or 0),
+                "favorite": row[0] in favorite_ids,
+                "instant_delivery": row[6] > 0,
+                "badges": (["Моментальная выдача"] if row[6] > 0 else []) +
+                          (["Популярное"] if row[8] >= 5 else []),
             }
             for row in rows
         ]
     })
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
-    return response
+
+async def webapp_product(request: web.Request) -> web.Response:
+    try:
+        cat_id = int(request.query.get("cat_id", "0"))
+    except ValueError:
+        return _webapp_response({"error": "Invalid category"}, 400)
+    user = await _webapp_authenticated_user(request)
+    row = await fetchone(
+        "SELECT c.id, c.name, c.desc, c.price, c.cat_group, c.updated_at, COUNT(DISTINCT i.id), "
+        "COALESCE(AVG(r.rating), 0), COUNT(DISTINCT r.id) "
+        "FROM categories c LEFT JOIN inventory i ON i.cat_id = c.id "
+        "LEFT JOIN reviews r ON r.cat_id = c.id "
+        "WHERE c.id = ? AND c.maintenance = 0 GROUP BY c.id", (cat_id,),
+    )
+    if not row:
+        return _webapp_response({"error": "Product not found"}, 404)
+    reviews = await fetchall(
+        "SELECT rating, text, created_at FROM reviews WHERE cat_id = ? "
+        "ORDER BY id DESC LIMIT 5", (cat_id,)
+    )
+    favorite = bool(user and await fetchone(
+        "SELECT 1 FROM favorites WHERE user_id = ? AND cat_id = ?", (user["id"], cat_id)
+    ))
+    has_purchased_product = bool(user and await fetchone(
+        "SELECT 1 FROM history WHERE user_id = ? AND cat_id = ? "
+        "AND status IN ('delivered', 'fulfilled') LIMIT 1",
+        (user["id"], cat_id),
+    ))
+    has_purchased_category = bool(user and await fetchone(
+        "SELECT 1 FROM history h "
+        "JOIN categories purchased_category ON purchased_category.id = h.cat_id "
+        "WHERE h.user_id = ? AND COALESCE(purchased_category.cat_group, 'other') = COALESCE(?, 'other') "
+        "AND h.status IN ('delivered', 'fulfilled') LIMIT 1",
+        (user["id"], row[4]),
+    ))
+    return _webapp_response({
+        "product": {
+            "id": row[0], "name": row[1], "description": re.sub(
+                r"<tg-emoji\b[^>]*>.*?</tg-emoji>|<[^>]+>", "",
+                html.unescape(row[2] or ""), flags=re.IGNORECASE | re.DOTALL,
+            ).strip(),
+            "price": row[3] or 0, "group": row[4] or "other", "updated_at": row[5], "stock": row[6],
+            "rating": round(float(row[7] or 0), 1), "reviews_count": int(row[8] or 0),
+            "favorite": favorite, "instant_delivery": row[6] > 0,
+            "has_purchased_product": has_purchased_product,
+            "has_purchased_category": has_purchased_category,
+            "reviews": [{"rating": r[0], "text": r[1], "date": r[2]} for r in reviews],
+        }
+    })
+
+async def webapp_favorites(request: web.Request) -> web.Response:
+    user = await _webapp_authenticated_user(request)
+    if not user:
+        return _webapp_response({"error": "Telegram authorization required"}, 401)
+    if request.method == "GET":
+        rows = await fetchall(
+            "SELECT c.id, c.name, c.price, c.cat_group, COUNT(DISTINCT i.id), "
+            "COALESCE(AVG(r.rating), 0), COUNT(DISTINCT r.id), f.notify_price, f.notify_stock "
+            "FROM favorites f "
+            "JOIN categories c ON c.id = f.cat_id LEFT JOIN inventory i ON i.cat_id = c.id "
+            "LEFT JOIN reviews r ON r.cat_id = c.id WHERE f.user_id = ? AND c.maintenance = 0 "
+            "GROUP BY c.id ORDER BY f.created_at DESC", (user["id"],)
+        )
+        return _webapp_response({"favorites": [
+            {"id": r[0], "name": r[1], "price": r[2], "group": r[3] or "other",
+             "stock": r[4], "rating": round(float(r[5] or 0), 1), "reviews_count": int(r[6] or 0),
+             "notify_price": bool(r[7]), "notify_stock": bool(r[8])}
+            for r in rows
+        ]})
+    try:
+        payload = await request.json()
+        cat_id = int(payload.get("cat_id"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return _webapp_response({"error": "Invalid category"}, 400)
+    exists = await fetchone(
+        "SELECT id FROM categories WHERE id = ? AND maintenance = 0", (cat_id,)
+    )
+    if not exists:
+        return _webapp_response({"error": "Product not found"}, 404)
+    if request.method == "DELETE" or payload.get("remove") is True:
+        await execute_query(
+            "DELETE FROM favorites WHERE user_id = ? AND cat_id = ?", (user["id"], cat_id), commit=True
+        )
+        return _webapp_response({"ok": True, "favorite": False})
+    if "notify_price" in payload or "notify_stock" in payload:
+        updates = []
+        values = []
+        if "notify_price" in payload:
+            updates.append("notify_price = ?")
+            values.append(1 if bool(payload["notify_price"]) else 0)
+        if "notify_stock" in payload:
+            updates.append("notify_stock = ?")
+            values.append(1 if bool(payload["notify_stock"]) else 0)
+        values.extend((user["id"], cat_id))
+        await execute_query(
+            f"UPDATE favorites SET {', '.join(updates)} WHERE user_id = ? AND cat_id = ?",
+            tuple(values), commit=True,
+        )
+        return _webapp_response({"ok": True, "favorite": True,
+                                 "notify_price": bool(payload.get("notify_price", True)),
+                                 "notify_stock": bool(payload.get("notify_stock", True))})
+    current = await fetchone("SELECT price, (SELECT COUNT(*) FROM inventory WHERE cat_id = ?) FROM categories WHERE id = ?",
+                             (cat_id, cat_id))
+    await execute_query(
+        "INSERT OR IGNORE INTO favorites "
+        "(user_id, cat_id, created_at, last_price, last_stock) VALUES (?, ?, ?, ?, ?)",
+        (user["id"], cat_id, datetime.now(timezone.utc).isoformat(),
+         float(current[0]) if current else 0, int(current[1]) if current else 0), commit=True,
+    )
+    return _webapp_response({"ok": True, "favorite": True})
+
+async def webapp_profile(request: web.Request) -> web.Response:
+    user = await _webapp_authenticated_user(request)
+    if not user:
+        return _webapp_response({
+            "error": "Telegram authorization required",
+            "auth_error": request.get("webapp_auth_error", "authorization_failed"),
+        }, 401)
+    row = await fetchone(
+        "SELECT id, username, total, created_at FROM users WHERE id = ?",
+        (user["id"],),
+    )
+    if not row:
+        return _webapp_response({"error": "User not found"}, 404)
+    balance = await get_balance(user["id"])
+    referral_count, referral_earnings = await get_referral_info(user["id"])
+    spent_row = await fetchone(
+        "SELECT COALESCE(SUM(amount), 0) FROM history WHERE user_id = ? AND status IN ('delivered', 'fulfilled')",
+        (user["id"],),
+    )
+    photo_url = user["user"].get("photo_url", "")
+    if not photo_url:
+        try:
+            photos = await get_active_bot().get_user_profile_photos(user_id=user["telegram_id"], limit=1)
+            if photos.total_count and photos.photos and photos.photos[0]:
+                photo_file = await get_active_bot().get_file(photos.photos[0][-1].file_id)
+                if photo_file.file_path:
+                    photo_url = f"https://api.telegram.org/file/bot{get_active_bot().token}/{photo_file.file_path}"
+        except Exception:
+            logger.exception("Failed to load Telegram profile photo for user %s", user["id"])
+    referral_link = f"https://t.me/{REFERRAL_BOT_USERNAME}?start=ref_{user['id']}"
+    return _webapp_response({
+        "user": {
+            "id": row[0],
+            "username": row[1] or user["username"],
+            "first_name": user["user"].get("first_name", ""),
+            "last_name": user["user"].get("last_name", ""),
+            "photo_url": photo_url,
+        },
+        "is_admin": user["id"] == ADMIN_ID,
+        "balance": round(float(balance or 0), 2),
+        "purchases": int(row[2] or 0),
+        "created_at": row[3],
+        "total_spent": round(float(spent_row[0] or 0), 2),
+        "recovery_phrase_ready": bool(await fetchone(
+            "SELECT 1 FROM account_recovery WHERE account_id = ?", (user["id"],)
+        )),
+        "referrals": {
+            "count": referral_count,
+            "earnings": round(float(referral_earnings or 0), 2),
+            "link": referral_link,
+        },
+    })
+
+async def webapp_history(request: web.Request) -> web.Response:
+    user = await _webapp_authenticated_user(request)
+    if not user:
+        return _webapp_response({"error": "Telegram authorization required"}, 401)
+    try:
+        limit = min(max(int(request.query.get("limit", "50")), 1), 100)
+        offset = min(max(int(request.query.get("offset", "0")), 0), 10000)
+    except ValueError:
+        return _webapp_response({"error": "Invalid pagination"}, 400)
+    sort = request.query.get("sort", "newest").lower()
+    order = "ASC" if sort == "oldest" else "DESC"
+    status_filter = request.query.get("status", "all").lower()
+    days_filter = request.query.get("days", "all")
+    conditions = ["h.user_id = ?"]
+    params = [user["id"]]
+    if status_filter in {"pending", "delivered", "fulfilled", "cancelled"}:
+        conditions.append("COALESCE(h.status, o.status, 'delivered') = ?")
+        params.append(status_filter)
+    if days_filter.isdigit() and int(days_filter) > 0:
+        conditions.append("COALESCE(h.created_at, h.date) >= ?")
+        params.append((datetime.now() - timedelta(days=int(days_filter))).isoformat())
+    params.extend((limit, offset))
+    rows = await fetchall(
+        f"""SELECT h.id, h.cat_id, c.name, h.item_data, h.date, h.created_at,
+                   h.order_id, h.order_number, h.payment_method, h.amount, h.status,
+                   o.status, o.total, o.payment_method, o.order_number
+            FROM history h LEFT JOIN categories c ON c.id = h.cat_id
+            LEFT JOIN orders o ON o.id = h.order_id
+            WHERE {' AND '.join(conditions)} ORDER BY COALESCE(h.created_at, h.date) {order}, h.id {order}
+            LIMIT ? OFFSET ?""",
+        tuple(params),
+    )
+    history = [
+            {
+                "id": row[0],
+                "cat_id": row[1],
+                "product": row[2] or "Товар",
+                # Inventory may contain credentials; the Mini App only needs
+                # a purchase record and must not expose them to browser code.
+                "item_preview": "Товар выдан",
+                "date": row[5] or row[4],
+                "order_id": row[6],
+                "order_number": row[7] or row[14] or (f"ALT-{row[0]:06d}"),
+                "payment_method": row[8] or row[13] or "balance",
+                "amount": round(float(row[9] or row[12] or 0), 2),
+                "status": row[10] or row[11] or "delivered",
+            }
+            for row in rows
+    ]
+    known_order_ids = {entry["order_id"] for entry in history if entry["order_id"]}
+    order_conditions = ["user_id = ?"]
+    order_params = [user["id"]]
+    if status_filter in {"pending", "delivered", "fulfilled", "cancelled"}:
+        order_conditions.append("status = ?")
+        order_params.append(status_filter)
+    if days_filter.isdigit() and int(days_filter) > 0:
+        order_conditions.append("created_at >= ?")
+        order_params.append((datetime.now() - timedelta(days=int(days_filter))).isoformat())
+    order_params.append(limit)
+    order_rows = await fetchall(
+        f"SELECT id, order_number, total, payment_method, status, item_count, created_at "
+        f"FROM orders WHERE {' AND '.join(order_conditions)} ORDER BY created_at DESC LIMIT ?",
+        tuple(order_params),
+    )
+    for row in order_rows:
+        if row[0] in known_order_ids:
+            continue
+        history.append({
+            "id": f"order-{row[0]}",
+            "cat_id": None,
+            "product": f"Заказ {row[1] or row[0]}",
+            "item_preview": f"{int(row[5] or 0)} товаров",
+            "date": row[6],
+            "order_id": row[0],
+            "order_number": row[1] or f"ALT-{row[0]:06d}",
+            "payment_method": row[3] or "balance",
+            "amount": round(float(row[2] or 0), 2),
+            "status": row[4] or "created",
+        })
+    history.sort(key=lambda entry: str(entry.get("date") or ""), reverse=sort != "oldest")
+    return _webapp_response({
+        "history": history[:limit],
+        "limit": limit,
+        "offset": offset,
+        "sort": "oldest" if order == "ASC" else "newest",
+    })
+
+async def webapp_reviews(request: web.Request) -> web.Response:
+    user = await _webapp_authenticated_user(request)
+    if request.method == "POST":
+        if not user:
+            return _webapp_response({"error": "Telegram authorization required"}, 401)
+        try:
+            payload = await request.json()
+            cat_id = int(payload.get("cat_id"))
+            rating = int(payload.get("rating"))
+            text = str(payload.get("text", "")).strip()[:1000]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return _webapp_response({"error": "Некорректный отзыв"}, 400)
+        if rating < 1 or rating > 5:
+            return _webapp_response({"error": "Оценка должна быть от 1 до 5"}, 400)
+        purchased = await fetchone(
+            "SELECT 1 FROM history WHERE user_id = ? AND cat_id = ? AND status IN ('delivered', 'fulfilled') LIMIT 1",
+            (user["id"], cat_id),
+        )
+        if not purchased:
+            return _webapp_response({"error": "Оставить отзыв можно после покупки"}, 403)
+        await execute_query(
+            "INSERT INTO reviews (user_id, cat_id, rating, text, created_at) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(user_id, cat_id) DO UPDATE SET rating = excluded.rating, text = excluded.text, created_at = excluded.created_at",
+            (user["id"], cat_id, rating, text, datetime.now(timezone.utc).isoformat()), commit=True,
+        )
+        return _webapp_response({"ok": True, "message": "Отзыв сохранён"})
+    try:
+        cat_id = int(request.query.get("cat_id", "0"))
+    except ValueError:
+        return _webapp_response({"error": "Invalid category"}, 400)
+    summary = await fetchone(
+        "SELECT COUNT(*), COALESCE(AVG(rating), 0) FROM reviews WHERE cat_id = ?",
+        (cat_id,),
+    )
+    rows = await fetchall(
+        "SELECT rating, text, created_at FROM reviews WHERE cat_id = ? ORDER BY id DESC LIMIT 10",
+        (cat_id,),
+    )
+    return _webapp_response({
+        "count": int(summary[0] or 0) if summary else 0,
+        "rating": round(float(summary[1] or 0), 1) if summary else 0,
+        "reviews": [
+            {"rating": row[0], "text": row[1] or "", "created_at": row[2]}
+            for row in rows
+        ],
+    })
+
+async def webapp_history_item(request: web.Request) -> web.Response:
+    user = await _webapp_authenticated_user(request)
+    if not user:
+        return _webapp_response({"error": "Telegram authorization required"}, 401)
+    try:
+        payload = await request.json()
+        history_id = int(payload.get("history_id"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return _webapp_response({"error": "Некорректный заказ"}, 400)
+    row = await fetchone(
+        "SELECT item_data, status FROM history WHERE id = ? AND user_id = ?",
+        (history_id, user["id"]),
+    )
+    if not row:
+        return _webapp_response({"error": "Товар не найден"}, 404)
+    if row[1] not in ("delivered", "fulfilled"):
+        return _webapp_response({"error": "Товар ещё не выдан"}, 409)
+    return _webapp_response({"ok": True, "item": row[0] or ""})
+
+async def webapp_promo(request: web.Request) -> web.Response:
+    user = await _webapp_authenticated_user(request)
+    if not user:
+        return _webapp_response({"error": "Telegram authorization required"}, 401)
+    try:
+        payload = await request.json()
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return _webapp_response({"error": "Invalid JSON"}, 400)
+    code = str(payload.get("code", "")).strip().upper()
+    if not code or len(code) > 64 or not re.fullmatch(r"[A-Z0-9_-]+", code):
+        return _webapp_response({"error": "Invalid promo code"}, 400)
+    promo = await fetchone(
+        "SELECT amount, max_uses, used, promo_type FROM promo_codes WHERE code = ?",
+        (code,),
+    )
+    if not promo:
+        return _webapp_response({"error": "Promo code not found"}, 404)
+    amount, max_uses, used, promo_type = promo
+    if int(used or 0) >= int(max_uses or 0):
+        return _webapp_response({"error": "Promo code limit reached"}, 409)
+    already_used = await fetchone(
+        "SELECT 1 FROM promo_usage WHERE code = ? AND user_id = ? LIMIT 1",
+        (code, user["id"]),
+    )
+    if already_used:
+        return _webapp_response({"error": "Promo code already used"}, 409)
+    if promo_type == "percent":
+        return _webapp_response({
+            "ok": True,
+            "code": code,
+            "promo_type": "percent",
+            "amount": round(float(amount), 2),
+            "message": f"Скидка {amount:g}% будет применена к покупке.",
+        })
+    conn = await transaction()
+    try:
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        fresh_promo = await (await conn.execute(
+            "SELECT max_uses, used FROM promo_codes WHERE code = ?", (code,)
+        )).fetchone()
+        fresh_usage = await (await conn.execute(
+            "SELECT 1 FROM promo_usage WHERE code = ? AND user_id = ? LIMIT 1",
+            (code, user["id"]),
+        )).fetchone()
+        if (
+            not fresh_promo or fresh_usage
+            or int(fresh_promo[1] or 0) >= int(fresh_promo[0] or 0)
+        ):
+            await conn.rollback()
+            return _webapp_response({"error": "Promo code limit reached"}, 409)
+        await conn.execute(
+            "INSERT INTO promo_usage (code, user_id, username, used_at) VALUES (?, ?, ?, ?)",
+            (code, user["id"], user["username"], now),
+        )
+        await conn.execute("UPDATE promo_codes SET used = used + 1 WHERE code = ?", (code,))
+        await conn.execute(
+            "INSERT INTO balances (user_id, balance) VALUES (?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET balance = balance + ?",
+            (user["id"], float(amount), float(amount)),
+        )
+        await conn.execute(
+            "INSERT INTO balance_history (user_id, amount, operation, date) VALUES (?, ?, ?, ?)",
+            (user["id"], float(amount), "promo", now),
+        )
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        logger.exception("Web App promo activation failed")
+        return _webapp_response({"error": "Promo activation failed"}, 409)
+    return _webapp_response({
+        "ok": True,
+        "code": code,
+        "promo_type": "fixed",
+        "amount": round(float(amount), 2),
+        "message": f"На баланс зачислено {float(amount):.2f} USDT.",
+    })
+
+async def webapp_deposit(request: web.Request) -> web.Response:
+    """Create a balance deposit invoice for an authenticated Mini App user."""
+    user = await _webapp_authenticated_user(request)
+    if not user:
+        return _webapp_response({"error": "Telegram authorization required"}, 401)
+    try:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            return _webapp_response({"error": "Invalid JSON"}, 400)
+        amount = round(float(payload.get("amount")), 2)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return _webapp_response({"error": "Invalid amount"}, 400)
+    provider = str(payload.get("provider", "")).strip().lower()
+    if provider not in {"xrocket", "cryptobot", "stars"}:
+        return _webapp_response({"error": "Unsupported payment provider"}, 400)
+    if not (1 <= amount <= 10000) or not (amount == amount):
+        return _webapp_response({"error": "Amount must be between 1 and 10000 USDT"}, 400)
+
+    if provider in {"xrocket", "cryptobot"}:
+        if provider == "xrocket":
+            invoice = await xrocket_create_invoice(
+                amount=amount,
+                description=f"Пополнение ALTERA пользователем {user['id']}",
+                expired_in=1800,
+            )
+        else:
+            invoice = await cryptobot_create_invoice(
+                amount=amount,
+                description=f"Пополнение ALTERA пользователем {user['id']}",
+                payload=json.dumps(
+                    {"type": "deposit", "user_id": user["id"]},
+                    separators=(",", ":"),
+                ),
+                expires_in=1800,
+            )
+        if not invoice.get("ok"):
+            return _webapp_response(
+                {"error": invoice.get("description", "Не удалось создать счёт")}, 502
+            )
+        invoice_id = str(invoice["id"])
+        pending_balance_payments[invoice_id] = {
+            "user_id": user["id"],
+            "amount": amount,
+            "created_at": datetime.now(timezone.utc),
+            "provider": provider,
+            "webapp": True,
+        }
+        return _webapp_response({
+            "ok": True,
+            "provider": provider,
+            "invoice_id": invoice_id,
+            "pay_url": invoice["link"],
+            "amount": amount,
+        })
+
+    stars = max(1, int(round(amount * STAR_USDT_RATE)))
+    try:
+        invoice_link = await get_active_bot().create_invoice_link(
+            title="Пополнение ALTERA",
+            description=f"Пополнение баланса на {amount:.2f} USDT",
+            payload=json.dumps(
+                {"type": "deposit", "amount": amount},
+                separators=(",", ":"),
+            ),
+            currency="XTR",
+            prices=[LabeledPrice(label=f"{amount:.2f} USDT", amount=stars)],
+        )
+    except Exception:
+        logger.exception("Mini App Stars invoice creation failed")
+        return _webapp_response({"error": "Не удалось создать счёт Telegram Stars"}, 502)
+    return _webapp_response({
+        "ok": True,
+        "provider": provider,
+        "invoice_link": invoice_link,
+        "amount": amount,
+        "stars": stars,
+    })
+
+async def webapp_deposit_status(request: web.Request) -> web.Response:
+    """Poll an external payment invoice while keeping ownership tied to initData."""
+    user = await _webapp_authenticated_user(request)
+    if not user:
+        return _webapp_response({"error": "Telegram authorization required"}, 401)
+    invoice_id = str(request.query.get("invoice_id", "")).strip()
+    if not invoice_id or len(invoice_id) > 128:
+        return _webapp_response({"error": "Invalid invoice"}, 400)
+    async with webapp_deposit_lock:
+        payment = pending_balance_payments.get(invoice_id)
+        if not payment:
+            return _webapp_response({"error": "Deposit not found"}, 404)
+        provider = payment.get("provider")
+        if payment.get("user_id") != user["id"] or provider not in {"xrocket", "cryptobot"}:
+            return _webapp_response({"error": "Deposit does not belong to this user"}, 403)
+        invoice = await get_provider_invoice(provider, invoice_id)
+        if not invoice.get("ok"):
+            return _webapp_response({"error": "Не удалось проверить оплату"}, 502)
+        if provider_invoice_is_paid(provider, invoice):
+            await update_balance(user["id"], float(payment["amount"]), "deposit")
+            pending_balance_payments.pop(invoice_id, None)
+            return _webapp_response({
+                "ok": True,
+                "status": "paid",
+                "amount": float(payment["amount"]),
+                "balance": round(float(await get_balance(user["id"]) or 0), 2),
+            })
+        if provider_invoice_is_expired(provider, invoice):
+            pending_balance_payments.pop(invoice_id, None)
+            return _webapp_response({"ok": True, "status": "expired"})
+    return _webapp_response({"ok": True, "status": "pending"})
+
+P2P_BUYER_FEE_PERCENT = Decimal("3")
+P2P_SELLER_DELIVERY_HOURS = 72
+P2P_BUYER_REVIEW_HOURS = 72
+P2P_BLOCKED_LISTING_TERMS = re.compile(
+    r"аккаунт|уч[её]тн|логин|парол|credential|password|login|account|"
+    r"госуслуг|банк|телеком|сим.?карт|sim.?card|номер телефона|паспорт|"
+    r"персональн.{0,12}данн|личн.{0,12}данн|взлом|краден",
+    re.IGNORECASE,
+)
+
+def _p2p_amount_cents(value: Any) -> Optional[int]:
+    raw_value = str(value).strip().replace(",", ".")
+    if not raw_value or len(raw_value) > 32:
+        return None
+    try:
+        amount = Decimal(raw_value)
+    except (InvalidOperation, ValueError, AttributeError):
+        return None
+    if not amount.is_finite() or amount.as_tuple().exponent < -2:
+        return None
+    if amount < Decimal("1.00") or amount > Decimal("10000.00"):
+        return None
+    amount = amount.quantize(Decimal("0.01"))
+    return int(amount * 100)
+
+def _p2p_money(cents: int) -> float:
+    return round(cents / 100, 2)
+
+def _p2p_fee_cents(price_cents: int) -> int:
+    return int(
+        (Decimal(price_cents) * P2P_BUYER_FEE_PERCENT / Decimal(100))
+        .quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    )
+
+async def _p2p_connect():
+    conn = await aiosqlite.connect("shop.db", timeout=10)
+    await conn.execute("PRAGMA foreign_keys = ON")
+    await conn.execute("PRAGMA busy_timeout = 10000")
+    return conn
+
+async def _p2p_credit(conn, user_id: int, cents: int, operation: str, reference: int):
+    amount = _p2p_money(cents)
+    await conn.execute(
+        "INSERT INTO balances (user_id, balance) VALUES (?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET balance = ROUND(balance + excluded.balance, 2)",
+        (user_id, amount),
+    )
+    await conn.execute(
+        "INSERT INTO balance_history (user_id, amount, operation, date, admin_id) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (user_id, amount, operation, datetime.now(timezone.utc).isoformat(), reference),
+    )
+
+async def _p2p_expire_deals() -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    conn = await _p2p_connect()
+    try:
+        await conn.execute("BEGIN IMMEDIATE")
+        expired = await (await conn.execute(
+            "SELECT id, listing_id, seller_id, buyer_id, price_cents, total_cents, status "
+            "FROM p2p_deals WHERE status IN ('funded', 'delivered') AND deadline_at <= ?",
+            (now,),
+        )).fetchall()
+        for deal_id, listing_id, seller_id, buyer_id, price_cents, total_cents, status in expired:
+            if status == "funded":
+                await _p2p_credit(conn, buyer_id, total_cents, "p2p_refund", deal_id)
+                await conn.execute(
+                    "UPDATE p2p_listings SET status = 'active', updated_at = ? "
+                    "WHERE id = ? AND status = 'reserved'",
+                    (now, listing_id),
+                )
+                final_status = "refunded"
+            else:
+                await _p2p_credit(conn, seller_id, price_cents, "p2p_sale", deal_id)
+                await conn.execute(
+                    "UPDATE p2p_listings SET status = 'sold', updated_at = ? WHERE id = ?",
+                    (now, listing_id),
+                )
+                final_status = "released"
+            await conn.execute(
+                "UPDATE p2p_deals SET status = ?, completed_at = ? WHERE id = ?",
+                (final_status, now, deal_id),
+            )
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        raise
+    finally:
+        await conn.close()
+    for deal_id, _listing_id, seller_id, buyer_id, _price_cents, _total_cents, status in expired:
+        recipient = buyer_id if status == "funded" else seller_id
+        message = (
+            f"Сделка #{deal_id}: срок выдачи истёк, деньги возвращены покупателю."
+            if status == "funded"
+            else f"Сделка #{deal_id}: срок спора истёк без обращения, средства перечислены продавцу."
+        )
+        asyncio.create_task(_notify_p2p_user(recipient, message))
+
+async def _notify_p2p_user(user_id: int, text: str) -> None:
+    try:
+        await get_active_bot().send_message(user_id, text)
+    except Exception:
+        logger.exception("P2P notification delivery failed for user %s", user_id)
+
+async def cleanup_p2p_deals():
+    while True:
+        await asyncio.sleep(60)
+        try:
+            await _p2p_expire_deals()
+        except Exception:
+            logger.exception("P2P deal expiry processing failed")
+
+async def webapp_p2p(request: web.Request) -> web.Response:
+    user = await _webapp_authenticated_user(request)
+    if not user:
+        return _webapp_response({"error": "Telegram authorization required"}, 401)
+    if await is_user_banned(user["id"]):
+        return _webapp_response({"error": "User is blocked"}, 403)
+    await _p2p_expire_deals()
+    user_id = user["id"]
+    listings = await fetchall(
+        "SELECT l.id, l.seller_id, l.title, l.description, l.price_cents, l.created_at, "
+        "COALESCE(u.username, '') FROM p2p_listings l JOIN users u ON u.id = l.seller_id "
+        "WHERE l.status = 'active' ORDER BY l.created_at DESC LIMIT 100"
+    )
+    own_listings = await fetchall(
+        "SELECT id, title, description, price_cents, status, created_at FROM p2p_listings "
+        "WHERE seller_id = ? ORDER BY created_at DESC LIMIT 100", (user_id,)
+    )
+    deals = await fetchall(
+        "SELECT d.id, d.listing_id, d.seller_id, d.buyer_id, d.price_cents, d.fee_cents, "
+        "d.total_cents, d.status, d.created_at, d.delivered_at, d.deadline_at, "
+        "d.dispute_reason, l.title, COALESCE(s.username, ''), COALESCE(b.username, '') "
+        "FROM p2p_deals d JOIN p2p_listings l ON l.id = d.listing_id "
+        "JOIN users s ON s.id = d.seller_id JOIN users b ON b.id = d.buyer_id "
+        "WHERE d.buyer_id = ? OR d.seller_id = ? ORDER BY d.created_at DESC LIMIT 100",
+        (user_id, user_id),
+    )
+    admin_disputes = []
+    admin_pending_listings = []
+    if user_id == ADMIN_ID:
+        admin_pending_listings = await fetchall(
+            "SELECT l.id, l.seller_id, l.title, l.description, l.price_cents, l.created_at, "
+            "COALESCE(u.username, '') FROM p2p_listings l JOIN users u ON u.id = l.seller_id "
+            "WHERE l.status = 'pending' ORDER BY l.created_at ASC LIMIT 100"
+        )
+        admin_disputes = await fetchall(
+            "SELECT d.id, d.listing_id, d.price_cents, d.fee_cents, d.total_cents, "
+            "d.created_at, d.dispute_reason, l.title, COALESCE(s.username, ''), "
+            "COALESCE(b.username, '') FROM p2p_deals d "
+            "JOIN p2p_listings l ON l.id = d.listing_id "
+            "JOIN users s ON s.id = d.seller_id JOIN users b ON b.id = d.buyer_id "
+            "WHERE d.status = 'disputed' ORDER BY d.created_at ASC LIMIT 100"
+        )
+    return _webapp_response({
+        "fee_percent": str(P2P_BUYER_FEE_PERCENT),
+        "balance": round(await get_balance(user_id), 2),
+        "is_admin": user_id == ADMIN_ID,
+        "listings": [
+            {"id": r[0], "seller_id": r[1], "title": r[2], "description": r[3],
+             "price": _p2p_money(r[4]), "created_at": r[5], "seller": r[6],
+             "fee": _p2p_money(_p2p_fee_cents(r[4])),
+             "buyer_total": _p2p_money(r[4] + _p2p_fee_cents(r[4])),
+             "is_owner": r[1] == user_id}
+            for r in listings
+        ],
+        "admin_pending_listings": [
+            {"id": r[0], "seller_id": r[1], "title": r[2], "description": r[3],
+             "price": _p2p_money(r[4]), "created_at": r[5], "seller": r[6]}
+            for r in admin_pending_listings
+        ],
+        "own_listings": [
+            {"id": r[0], "title": r[1], "description": r[2], "price": _p2p_money(r[3]),
+             "status": r[4], "created_at": r[5]}
+            for r in own_listings
+        ],
+        "deals": [
+            {"id": r[0], "listing_id": r[1], "seller_id": r[2], "buyer_id": r[3],
+             "price": _p2p_money(r[4]), "fee": _p2p_money(r[5]), "total": _p2p_money(r[6]),
+             "status": r[7], "created_at": r[8], "delivered_at": r[9], "deadline_at": r[10],
+             "dispute_reason": r[11], "title": r[12], "seller": r[13], "buyer": r[14]}
+            for r in deals
+        ],
+        "admin_disputes": [
+            {"id": r[0], "listing_id": r[1], "price": _p2p_money(r[2]),
+             "fee": _p2p_money(r[3]), "total": _p2p_money(r[4]), "created_at": r[5],
+             "reason": r[6], "title": r[7], "seller": r[8], "buyer": r[9]}
+            for r in admin_disputes
+        ],
+    })
+
+async def webapp_p2p_listing(request: web.Request) -> web.Response:
+    user = await _webapp_authenticated_user(request)
+    if not user:
+        return _webapp_response({"error": "Telegram authorization required"}, 401)
+    if await is_user_banned(user["id"]):
+        return _webapp_response({"error": "User is blocked"}, 403)
+    try:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Некорректное объявление.")
+        title = str(payload.get("title", "")).strip()
+        description = str(payload.get("description", "")).strip()
+        price_cents = _p2p_amount_cents(payload.get("price"))
+        if payload.get("legal_goods_confirmed") is not True:
+            raise ValueError("Подтвердите, что имеете право продавать этот товар.")
+        if not 5 <= len(title) <= 80:
+            raise ValueError("Название должно быть от 5 до 80 символов.")
+        if not 10 <= len(description) <= 2000:
+            raise ValueError("Описание должно быть от 10 до 2000 символов.")
+        if price_cents is None:
+            raise ValueError("Цена должна быть от 1 до 10 000 USDT.")
+        if P2P_BLOCKED_LISTING_TERMS.search(f"{title}\n{description}"):
+            raise ValueError(
+                "Этот раздел предназначен только для законных цифровых товаров и услуг. "
+                "Нельзя размещать аккаунты, доступы, документы или персональные данные."
+            )
+        now = datetime.now(timezone.utc).isoformat()
+        conn = await _p2p_connect()
+        try:
+            await conn.execute("BEGIN IMMEDIATE")
+            cursor = await conn.execute(
+                "INSERT INTO p2p_listings "
+                "(seller_id, title, description, price_cents, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, 'pending', ?, ?)",
+                (user["id"], title, description, price_cents, now, now),
+            )
+            listing_id = cursor.lastrowid
+            await conn.commit()
+        except Exception:
+            await conn.rollback()
+            raise
+        finally:
+            await conn.close()
+        asyncio.create_task(_notify_p2p_user(
+            ADMIN_ID, f"Новое P2P-объявление #{listing_id} отправлено на проверку: {title}"
+        ))
+        return _webapp_response({"ok": True, "listing_id": listing_id})
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        return _webapp_response({"error": str(exc) or "Invalid listing"}, 400)
+    except Exception:
+        logger.exception("Failed to create P2P listing for user %s", user["id"])
+        return _webapp_response({"error": "Не удалось создать объявление. Попробуйте позже."}, 500)
+
+async def webapp_p2p_deal(request: web.Request) -> web.Response:
+    user = await _webapp_authenticated_user(request)
+    if not user:
+        return _webapp_response({"error": "Telegram authorization required"}, 401)
+    if await is_user_banned(user["id"]):
+        return _webapp_response({"error": "User is blocked"}, 403)
+    try:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Некорректный запрос сделки.")
+        listing_id = int(payload.get("listing_id", 0))
+        idempotency_key = str(payload.get("idempotency_key", "")).strip()
+        if listing_id < 1 or not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", idempotency_key):
+            raise ValueError("Некорректный запрос сделки.")
+        now = datetime.now(timezone.utc)
+        now_text = now.isoformat()
+        seller_deadline = (now + timedelta(hours=P2P_SELLER_DELIVERY_HOURS)).isoformat()
+        conn = await _p2p_connect()
+        try:
+            await conn.execute("BEGIN IMMEDIATE")
+            prior = await (await conn.execute(
+                "SELECT id, status FROM p2p_deals WHERE buyer_id = ? AND idempotency_key = ?",
+                (user["id"], idempotency_key),
+            )).fetchone()
+            if prior:
+                await conn.commit()
+                return _webapp_response({"ok": True, "deal_id": prior[0], "status": prior[1], "existing": True})
+            listing = await (await conn.execute(
+                "SELECT seller_id, price_cents FROM p2p_listings WHERE id = ? AND status = 'active'",
+                (listing_id,),
+            )).fetchone()
+            if not listing:
+                raise ValueError("Объявление уже куплено или снято с продажи.")
+            seller_id, price_cents = listing
+            if seller_id == user["id"]:
+                raise ValueError("Нельзя купить собственное объявление.")
+            fee_cents = _p2p_fee_cents(price_cents)
+            total_cents = price_cents + fee_cents
+            total = _p2p_money(total_cents)
+            debit = await conn.execute(
+                "UPDATE balances SET balance = ROUND(balance - ?, 2) "
+                "WHERE user_id = ? AND balance >= ?",
+                (total, user["id"], total),
+            )
+            if debit.rowcount != 1:
+                raise ValueError(
+                    f"Недостаточно средств. С учётом комиссии 3% нужно {_p2p_money(total_cents):.2f} USDT."
+                )
+            await conn.execute(
+                "INSERT INTO balance_history (user_id, amount, operation, date, admin_id) "
+                "VALUES (?, ?, 'p2p_escrow', ?, ?)",
+                (user["id"], -total, now_text, listing_id),
+            )
+            updated = await conn.execute(
+                "UPDATE p2p_listings SET status = 'reserved', updated_at = ? "
+                "WHERE id = ? AND status = 'active'",
+                (now_text, listing_id),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("Объявление уже куплено.")
+            cursor = await conn.execute(
+                "INSERT INTO p2p_deals "
+                "(listing_id, seller_id, buyer_id, price_cents, fee_cents, total_cents, "
+                "status, idempotency_key, created_at, deadline_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'funded', ?, ?, ?)",
+                (listing_id, seller_id, user["id"], price_cents, fee_cents, total_cents,
+                 idempotency_key, now_text, seller_deadline),
+            )
+            deal_id = cursor.lastrowid
+            await conn.commit()
+        except ValueError:
+            await conn.rollback()
+            raise
+        except Exception:
+            await conn.rollback()
+            raise
+        finally:
+            await conn.close()
+        asyncio.create_task(_notify_p2p_user(
+            seller_id, f"Ваше объявление куплено. Сделка #{deal_id} на {_p2p_money(price_cents):.2f} USDT. "
+            f"Выдайте товар и отметьте сделку как выданную в Mini App в течение {P2P_SELLER_DELIVERY_HOURS} часов."
+        ))
+        return _webapp_response({
+            "ok": True, "deal_id": deal_id, "status": "funded",
+            "price": _p2p_money(price_cents), "fee": _p2p_money(fee_cents),
+            "total": _p2p_money(total_cents),
+        })
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        return _webapp_response({"error": str(exc) or "Invalid deal"}, 400)
+    except Exception:
+        logger.exception("Failed to create P2P deal for user %s", user["id"])
+        return _webapp_response({"error": "Не удалось начать сделку. Попробуйте позже."}, 500)
+
+async def webapp_p2p_action(request: web.Request) -> web.Response:
+    user = await _webapp_authenticated_user(request)
+    if not user:
+        return _webapp_response({"error": "Telegram authorization required"}, 401)
+    if await is_user_banned(user["id"]):
+        return _webapp_response({"error": "User is blocked"}, 403)
+    await _p2p_expire_deals()
+    try:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Некорректное действие.")
+        action = str(payload.get("action", "")).strip()
+        now = datetime.now(timezone.utc)
+        now_text = now.isoformat()
+        conn = await _p2p_connect()
+        notifications = []
+        try:
+            await conn.execute("BEGIN IMMEDIATE")
+            if action == "cancel-listing":
+                listing_id = int(payload.get("listing_id", 0))
+                cursor = await conn.execute(
+                    "UPDATE p2p_listings SET status = 'cancelled', updated_at = ? "
+                    "WHERE id = ? AND seller_id = ? AND status IN ('pending', 'active')",
+                    (now_text, listing_id, user["id"]),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("Можно снять только своё активное объявление.")
+            elif action in {"admin-approve-listing", "admin-reject-listing"}:
+                if user["id"] != ADMIN_ID:
+                    raise ValueError("Проверять объявления может только администратор.")
+                listing_id = int(payload.get("listing_id", 0))
+                cursor = await conn.execute(
+                    "UPDATE p2p_listings SET status = ?, updated_at = ? "
+                    "WHERE id = ? AND status = 'pending'",
+                    ("active" if action == "admin-approve-listing" else "rejected",
+                     now_text, listing_id),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("Объявление уже проверено или не найдено.")
+                owner = await (await conn.execute(
+                    "SELECT seller_id FROM p2p_listings WHERE id = ?", (listing_id,)
+                )).fetchone()
+                notifications.append((
+                    owner[0],
+                    f"Объявление #{listing_id} "
+                    f"{'одобрено и опубликовано' if action == 'admin-approve-listing' else 'отклонено'}."
+                ))
+            else:
+                deal_id = int(payload.get("deal_id", 0))
+                deal = await (await conn.execute(
+                    "SELECT listing_id, seller_id, buyer_id, price_cents, fee_cents, total_cents, status "
+                    "FROM p2p_deals WHERE id = ?", (deal_id,),
+                )).fetchone()
+                if not deal:
+                    raise ValueError("Сделка не найдена.")
+                listing_id, seller_id, buyer_id, price_cents, fee_cents, total_cents, status = deal
+                if action == "mark-delivered":
+                    if user["id"] != seller_id or status != "funded":
+                        raise ValueError("Отметить выдачу может только продавец активной сделки.")
+                    deadline = (now + timedelta(hours=P2P_BUYER_REVIEW_HOURS)).isoformat()
+                    await conn.execute(
+                        "UPDATE p2p_deals SET status = 'delivered', delivered_at = ?, deadline_at = ? "
+                        "WHERE id = ? AND status = 'funded'",
+                        (now_text, deadline, deal_id),
+                    )
+                    notifications.append((buyer_id, f"Продавец отметил выдачу в сделке #{deal_id}. "
+                        f"Проверьте товар: подтвердите получение или откройте спор в течение "
+                        f"{P2P_BUYER_REVIEW_HOURS} часов."))
+                elif action == "confirm":
+                    if user["id"] != buyer_id or status != "delivered":
+                        raise ValueError("Подтвердить получение может только покупатель после выдачи.")
+                    deadline = datetime.fromisoformat(
+                        await (await conn.execute(
+                            "SELECT deadline_at FROM p2p_deals WHERE id = ?", (deal_id,)
+                        )).fetchone()[0]
+                    )
+                    if deadline <= now:
+                        raise ValueError("Срок подтверждения завершён; сделка будет обработана автоматически.")
+                    await _p2p_credit(conn, seller_id, price_cents, "p2p_sale", deal_id)
+                    await conn.execute(
+                        "UPDATE p2p_deals SET status = 'released', completed_at = ? WHERE id = ?",
+                        (now_text, deal_id),
+                    )
+                    await conn.execute(
+                        "UPDATE p2p_listings SET status = 'sold', updated_at = ? WHERE id = ?",
+                        (now_text, listing_id),
+                    )
+                    notifications.append((seller_id, f"Покупатель подтвердил получение в сделке #{deal_id}. "
+                        f"{_p2p_money(price_cents):.2f} USDT зачислено на ваш баланс."))
+                elif action == "dispute":
+                    reason = str(payload.get("reason", "")).strip()
+                    if user["id"] != buyer_id or status != "delivered":
+                        raise ValueError("Спор может открыть только покупатель после выдачи товара.")
+                    if not 10 <= len(reason) <= 1000:
+                        raise ValueError("Опишите проблему минимум в 10 символах.")
+                    deadline_row = await (await conn.execute(
+                        "SELECT deadline_at FROM p2p_deals WHERE id = ?", (deal_id,)
+                    )).fetchone()
+                    deadline = datetime.fromisoformat(deadline_row[0])
+                    if deadline <= now:
+                        raise ValueError("Срок открытия спора завершён.")
+                    await conn.execute(
+                        "UPDATE p2p_deals SET status = 'disputed', dispute_reason = ? WHERE id = ?",
+                        (reason, deal_id),
+                    )
+                    notifications.append((seller_id, f"Покупатель открыл спор по сделке #{deal_id}. "
+                        "Средства удерживаются до решения администратора."))
+                    notifications.append((ADMIN_ID, f"Открыт спор по P2P-сделке #{deal_id}. "
+                        "Средства удерживаются; требуется решение администратора в Mini App."))
+                elif action in {"admin-release", "admin-refund"}:
+                    if user["id"] != ADMIN_ID or status != "disputed":
+                        raise ValueError("Разрешить спор может только администратор.")
+                    note = str(payload.get("note", "")).strip()
+                    if not 5 <= len(note) <= 1000:
+                        raise ValueError("Добавьте примечание к решению (5–1000 символов).")
+                    if action == "admin-release":
+                        await _p2p_credit(conn, seller_id, price_cents, "p2p_sale", deal_id)
+                        final_status = "released"
+                        await conn.execute(
+                            "UPDATE p2p_listings SET status = 'sold', updated_at = ? WHERE id = ?",
+                            (now_text, listing_id),
+                        )
+                        outcome = f"Средства продавцу: {_p2p_money(price_cents):.2f} USDT."
+                    else:
+                        await _p2p_credit(conn, buyer_id, total_cents, "p2p_refund", deal_id)
+                        final_status = "refunded"
+                        await conn.execute(
+                            "UPDATE p2p_listings SET status = 'active', updated_at = ? WHERE id = ?",
+                            (now_text, listing_id),
+                        )
+                        outcome = f"Покупателю возвращено {_p2p_money(total_cents):.2f} USDT."
+                    await conn.execute(
+                        "UPDATE p2p_deals SET status = ?, completed_at = ?, resolution_note = ? WHERE id = ?",
+                        (final_status, now_text, note, deal_id),
+                    )
+                    notifications.append((buyer_id, f"Спор по сделке #{deal_id} решён. {outcome}"))
+                    notifications.append((seller_id, f"Спор по сделке #{deal_id} решён. {outcome}"))
+                else:
+                    raise ValueError("Неизвестное действие по сделке.")
+            await conn.commit()
+        except ValueError:
+            await conn.rollback()
+            raise
+        except Exception:
+            await conn.rollback()
+            raise
+        finally:
+            await conn.close()
+        for recipient, message in notifications:
+            asyncio.create_task(_notify_p2p_user(recipient, message))
+        return _webapp_response({"ok": True})
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        return _webapp_response({"error": str(exc) or "Invalid action"}, 400)
+    except Exception:
+        logger.exception("Failed to apply P2P action for user %s", user["id"])
+        return _webapp_response({"error": "Не удалось обновить сделку. Попробуйте позже."}, 500)
 
 async def webapp_options(request: web.Request) -> web.Response:
     return web.Response(
         status=204,
         headers={
             "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type",
+            "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, X-Telegram-Init-Data",
         },
     )
 
@@ -3638,7 +5632,40 @@ async def start_webapp_server() -> Optional[web.AppRunner]:
         return None
     app = web.Application()
     app.router.add_get("/api/catalog", webapp_catalog)
-    app.router.add_options("/api/catalog", webapp_options)
+    app.router.add_get("/api/product", webapp_product)
+    app.router.add_get("/api/favorites", webapp_favorites)
+    app.router.add_post("/api/favorites", webapp_favorites)
+    app.router.add_delete("/api/favorites", webapp_favorites)
+    for route in (
+        "/api/catalog", "/api/profile", "/api/history", "/api/reviews", "/api/promo",
+        "/api/deposit",         "/api/deposit/status", "/api/purchase", "/api/purchase/status",
+        "/api/product", "/api/favorites", "/api/reviews", "/api/history/item",
+        "/api/p2p", "/api/p2p/listings", "/api/p2p/deals", "/api/p2p/deals/action",
+        "/api/account/status", "/api/account/register", "/api/account/login",
+        "/api/account/recovery/start", "/api/account/recovery/challenge",
+        "/api/account/recovery/confirm",
+    ):
+        app.router.add_options(route, webapp_options)
+    app.router.add_get("/api/account/status", webapp_account_status)
+    app.router.add_post("/api/account/register", webapp_account_register)
+    app.router.add_post("/api/account/login", webapp_account_login)
+    app.router.add_post("/api/account/recovery/start", webapp_recovery_start)
+    app.router.add_post("/api/account/recovery/challenge", webapp_recovery_challenge)
+    app.router.add_post("/api/account/recovery/confirm", webapp_recovery_confirm)
+    app.router.add_get("/api/profile", webapp_profile)
+    app.router.add_get("/api/history", webapp_history)
+    app.router.add_get("/api/reviews", webapp_reviews)
+    app.router.add_post("/api/reviews", webapp_reviews)
+    app.router.add_post("/api/history/item", webapp_history_item)
+    app.router.add_post("/api/promo", webapp_promo)
+    app.router.add_post("/api/purchase", webapp_purchase_api)
+    app.router.add_get("/api/purchase/status", webapp_purchase_status)
+    app.router.add_post("/api/deposit", webapp_deposit)
+    app.router.add_get("/api/deposit/status", webapp_deposit_status)
+    app.router.add_get("/api/p2p", webapp_p2p)
+    app.router.add_post("/api/p2p/listings", webapp_p2p_listing)
+    app.router.add_post("/api/p2p/deals", webapp_p2p_deal)
+    app.router.add_post("/api/p2p/deals/action", webapp_p2p_action)
     app.router.add_get(
         "/",
         lambda request: web.FileResponse(
@@ -3659,6 +5686,369 @@ async def start_webapp_server() -> Optional[web.AppRunner]:
     logger.info("Web App server started")
     return runner
 
+async def _reserve_webapp_percent_promo(user_id: int, code: str) -> Optional[float]:
+    conn = await transaction()
+    try:
+        promo = await (await conn.execute(
+            "SELECT amount, max_uses, used, promo_type FROM promo_codes WHERE code = ?",
+            (code,),
+        )).fetchone()
+        used = await (await conn.execute(
+            "SELECT 1 FROM promo_usage WHERE code = ? AND user_id = ? LIMIT 1",
+            (code, user_id),
+        )).fetchone()
+        if (
+            not promo or promo[3] != "percent" or used
+            or int(promo[2] or 0) >= int(promo[1] or 0)
+        ):
+            await conn.rollback()
+            return None
+        username_row = await (await conn.execute(
+            "SELECT COALESCE(username, '') FROM users WHERE id = ?", (user_id,)
+        )).fetchone()
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        await conn.execute(
+            "INSERT INTO promo_usage (code, user_id, username, used_at) VALUES (?, ?, ?, ?)",
+            (code, user_id, username_row[0] if username_row else "", now),
+        )
+        await conn.execute("UPDATE promo_codes SET used = used + 1 WHERE code = ?", (code,))
+        await conn.commit()
+        return min(max(float(promo[0]), 0), 100)
+    except Exception:
+        await conn.rollback()
+        logger.exception("Web App promo reservation failed")
+        return None
+
+async def _prepare_webapp_purchase(payload: dict, user_id: int):
+    """Validate a Mini App purchase and calculate its server-side total."""
+    if payload.get("action") != "purchase":
+        raise ValueError("Unknown purchase action")
+    raw_items = payload.get("items")
+    if raw_items is None:
+        raw_items = [{"cat_id": payload.get("cat_id"), "quantity": payload.get("quantity")}]
+    if not isinstance(raw_items, list) or not raw_items or len(raw_items) > 20:
+        raise ValueError("Invalid cart")
+
+    cart_items = []
+    categories_data = []
+    seen = set()
+    base_total = 0.0
+    for raw_item in raw_items:
+        try:
+            cat_id = int(raw_item["cat_id"])
+            quantity = int(raw_item["quantity"])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("Invalid purchase items")
+        if quantity < 1 or quantity > MAX_QUANTITY_PER_PURCHASE or cat_id in seen:
+            raise ValueError("Invalid purchase quantity")
+        category = await fetchone(
+            "SELECT id, name, price FROM categories WHERE id = ? AND maintenance = 0",
+            (cat_id,),
+        )
+        stock = await fetchone("SELECT COUNT(*) FROM inventory WHERE cat_id = ?", (cat_id,))
+        if not category or not stock or stock[0] < quantity:
+            raise ValueError("Insufficient stock")
+        seen.add(cat_id)
+        cart_items.append((cat_id, quantity))
+        categories_data.append(category)
+        line_total = float(category[2]) * quantity
+        if quantity >= 10:
+            line_total *= 0.8
+        base_total += line_total
+
+    base_total = round(base_total, 2)
+    promo_code = str(payload.get("promo_code", "")).strip().upper()
+    if promo_code and (
+        len(promo_code) > 64 or not re.fullmatch(r"[A-Z0-9_-]+", promo_code)
+    ):
+        raise ValueError("Invalid promo code")
+    promo_percent = 0.0
+    if promo_code:
+        promo = await fetchone(
+            "SELECT amount, max_uses, used, promo_type FROM promo_codes WHERE code = ?",
+            (promo_code,),
+        )
+        already_used = await fetchone(
+            "SELECT 1 FROM promo_usage WHERE code = ? AND user_id = ? LIMIT 1",
+            (promo_code, user_id),
+        )
+        if (
+            not promo or already_used or promo[3] != "percent"
+            or int(promo[2] or 0) >= int(promo[1] or 0)
+        ):
+            raise ValueError("Promo code is invalid or already used")
+        promo_percent = min(max(float(promo[0]), 0), 100)
+    total = round(base_total * (1 - promo_percent / 100), 2)
+    return cart_items, categories_data, base_total, total, promo_code
+
+async def webapp_purchase_api(request: web.Request) -> web.Response:
+    """Create or complete a purchase from a Telegram-authenticated Mini App."""
+    user = await _webapp_authenticated_user(request)
+    if not user:
+        return _webapp_response({"error": "Telegram authorization required"}, 401)
+    if await is_user_banned(user["id"]):
+        return _webapp_response({"error": "User is blocked"}, 403)
+    try:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Invalid JSON")
+        (
+            cart_items,
+            categories_data,
+            base_total,
+            total,
+            promo_code,
+        ) = await _prepare_webapp_purchase(payload, user["id"])
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        return _webapp_response({"error": str(exc) or "Invalid purchase"}, 400)
+
+    payment = str(payload.get("payment", "")).strip().lower()
+    if payment not in {"balance", "xrocket", "cryptobot", "stars"}:
+        return _webapp_response({"error": "Choose balance, xRocket, CryptoBot, or Telegram Stars"}, 400)
+    idempotency_key = str(payload.get("idempotency_key", "")).strip()
+    if not idempotency_key or len(idempotency_key) > 128:
+        return _webapp_response({"error": "Invalid payment request"}, 400)
+
+    if payment == "balance":
+        order = await create_webapp_order(
+            user["id"], total, "balance",
+            item_count=sum(quantity for _, quantity in cart_items),
+            idempotency_key=idempotency_key,
+        )
+        if order.get("existing") and order.get("status") in ("paid", "fulfilled"):
+            return _webapp_response({
+                "ok": True, "provider": "balance", "status": "paid",
+                "order_id": order["id"], "order_number": order["number"],
+                "amount": order["total"], "items": [],
+            })
+        if len(cart_items) == 1:
+            cat_id, quantity = cart_items[0]
+            items = await buy_items_with_transaction(
+                cat_id, quantity, user["id"], base_total, promo_code,
+                order_id=order["id"], payment_method="balance",
+            )
+        else:
+            items = await buy_cart_with_transaction(
+                cart_items, user["id"], base_total, promo_code,
+                order_id=order["id"], payment_method="balance",
+            )
+        if not items:
+            await update_order_status(order["id"], "cancelled", error="Insufficient balance or stock")
+            return _webapp_response(
+                {"error": "Insufficient balance, stock, or promo code is no longer valid"},
+                409,
+            )
+        return _webapp_response({
+            "ok": True,
+            "provider": "balance",
+            "status": "paid",
+            "order_id": order["id"],
+            "order_number": order["number"],
+            "amount": total,
+            "balance": round(float(await get_balance(user["id"]) or 0), 2),
+            "items": [{"data": item_data} for _, item_data in items],
+        })
+
+    if payment == "stars":
+        if len(cart_items) != 1:
+            return _webapp_response(
+                {"error": "Telegram Stars are available for one item only"}, 400
+            )
+        cat_id, quantity = cart_items[0]
+        stars = max(1, int(round(total * STAR_USDT_RATE)))
+        order = await create_webapp_order(
+            user["id"], total, "stars", item_count=quantity,
+            idempotency_key=idempotency_key,
+        )
+        if order.get("existing"):
+            return _webapp_response({
+                "ok": True, "provider": "stars", "status": order["status"],
+                "order_id": order["id"], "order_number": order["number"],
+                "amount": order["total"], "invoice_link": order.get("invoice_id"),
+            })
+        try:
+            invoice_link = await get_active_bot().create_invoice_link(
+                title="Покупка в ALTERA",
+                description=f"{categories_data[0][1]} x{quantity} — {total:.2f} USDT",
+                payload=json.dumps({
+                    "type": "purchase",
+                    "cat_id": cat_id,
+                    "quantity": quantity,
+                    "base_total": base_total,
+                    "total": total,
+                    "promo_code": promo_code,
+                    "order_id": order["id"],
+                }, separators=(",", ":")),
+                currency="XTR",
+                prices=[LabeledPrice(
+                    label=f"{categories_data[0][1]} x{quantity}",
+                    amount=stars,
+                )],
+            )
+        except Exception:
+            await update_order_status(order["id"], "cancelled", error="Stars invoice creation failed")
+            logger.exception("Mini App purchase Stars invoice creation failed")
+            return _webapp_response({"error": "Could not create Telegram Stars invoice"}, 502)
+        await update_order_status(order["id"], "pending", invoice_id=invoice_link)
+        return _webapp_response({
+            "ok": True,
+            "provider": "stars",
+            "status": "pending",
+            "order_id": order["id"],
+            "order_number": order["number"],
+            "invoice_link": invoice_link,
+            "amount": total,
+            "stars": stars,
+        })
+
+    if total <= 0:
+        return _webapp_response({"error": "External payments cannot process a zero-value purchase"}, 400)
+    if promo_code and await _reserve_webapp_percent_promo(user["id"], promo_code) is None:
+        return _webapp_response({"error": "Promo code is no longer valid"}, 409)
+    description = ", ".join(
+        f"{category[1]} x{quantity}"
+        for category, (_, quantity) in zip(categories_data, cart_items)
+    )
+    existing_order = await fetchone(
+        "SELECT id, order_number, invoice_id, status, total, payment_method FROM orders "
+        "WHERE user_id = ? AND idempotency_key = ?",
+        (user["id"], idempotency_key),
+    )
+    if existing_order and existing_order[2] and existing_order[2] in pending_payments:
+        pending = pending_payments[existing_order[2]]
+        return _webapp_response({
+            "ok": True, "provider": existing_order[5], "status": existing_order[3],
+            "invoice_id": existing_order[2], "order_id": existing_order[0],
+            "order_number": existing_order[1], "pay_url": pending.get("pay_url"),
+            "amount": existing_order[4],
+        })
+    if payment == "xrocket":
+        invoice = await xrocket_create_invoice(
+            amount=total, description=description, expired_in=1800
+        )
+    else:
+        invoice = await cryptobot_create_invoice(
+            amount=total,
+            description=f"Покупка ALTERA: {description}",
+            payload=json.dumps(
+                {"type": "purchase", "user_id": user["id"], "idempotency_key": idempotency_key},
+                separators=(",", ":"),
+            ),
+            expires_in=1800,
+        )
+    if not invoice.get("ok"):
+        return _webapp_response(
+            {"error": invoice.get("description", "Could not create payment invoice")},
+            502,
+        )
+    invoice_id = str(invoice["id"])
+    order = await create_webapp_order(
+        user["id"], total, payment, invoice_id=invoice_id,
+        item_count=sum(quantity for _, quantity in cart_items),
+        idempotency_key=idempotency_key,
+    )
+    first_cat_id, first_quantity = cart_items[0]
+    pending_payments[invoice_id] = {
+        "user_id": user["id"],
+        "cat_id": first_cat_id if len(cart_items) == 1 else None,
+        "quantity": first_quantity,
+        "cart_items": cart_items if len(cart_items) > 1 else None,
+        "total": total,
+        "created_at": datetime.now(),
+        "is_preorder": False,
+        "provider": payment,
+        "webapp": True,
+        "order_id": order["id"],
+        "order_number": order["number"],
+        "pay_url": invoice["link"],
+    }
+    asyncio.create_task(auto_check_payment(
+        invoice_id,
+        user["id"],
+        first_cat_id if len(cart_items) == 1 else None,
+        first_quantity,
+        None,
+        total,
+        payment,
+        cart_items if len(cart_items) > 1 else None,
+    ))
+    return _webapp_response({
+        "ok": True,
+        "provider": payment,
+        "status": "pending",
+        "invoice_id": invoice_id,
+        "order_id": order["id"],
+        "order_number": order["number"],
+        "pay_url": invoice["link"],
+        "amount": total,
+    })
+
+async def webapp_purchase_status(request: web.Request) -> web.Response:
+    """Check and, once only, fulfil an external-payment Web App order."""
+    user = await _webapp_authenticated_user(request)
+    if not user:
+        return _webapp_response({"error": "Telegram authorization required"}, 401)
+    invoice_id = str(request.query.get("invoice_id", "")).strip()
+    if not invoice_id or len(invoice_id) > 128:
+        return _webapp_response({"error": "Invalid invoice"}, 400)
+    payment = pending_payments.get(invoice_id)
+    if payment is None:
+        row = await fetchone(
+            "SELECT id, order_number, status, total, payment_method FROM orders "
+            "WHERE invoice_id = ? AND user_id = ?", (invoice_id, user["id"])
+        )
+        if not row:
+            return _webapp_response({"error": "Order not found"}, 404)
+        return _webapp_response({
+            "ok": True, "status": "paid" if row[2] in ("paid", "fulfilled") else row[2],
+            "order_id": row[0], "order_number": row[1], "amount": row[3],
+        })
+    if payment.get("user_id") != user["id"]:
+        return _webapp_response({"error": "Order does not belong to this user"}, 403)
+    provider = payment.get("provider")
+    invoice = await get_provider_invoice(provider, invoice_id)
+    if not invoice.get("ok"):
+        return _webapp_response({"error": "Не удалось проверить оплату"}, 502)
+    if provider_invoice_is_expired(provider, invoice):
+        await update_order_status(payment.get("order_id"), "cancelled", error="Invoice expired")
+        pending_payments.pop(invoice_id, None)
+        return _webapp_response({"ok": True, "status": "expired"})
+    if not provider_invoice_is_paid(provider, invoice):
+        return _webapp_response({
+            "ok": True, "status": "pending", "order_id": payment.get("order_id"),
+            "order_number": payment.get("order_number"),
+        })
+    async with payment_finalize_lock:
+        items = (
+            await buy_cart_with_transaction(
+                payment.get("cart_items"), user["id"], payment["total"],
+                order_id=payment.get("order_id"), payment_method=provider,
+            )
+            if payment.get("cart_items") else
+            await buy_items_with_transaction(
+                payment.get("cat_id"), payment["quantity"], user["id"], payment["total"],
+                order_id=payment.get("order_id"), payment_method=provider,
+            )
+        )
+    if not items:
+        fulfilled = await fetchone(
+            "SELECT status FROM orders WHERE id = ?", (payment.get("order_id"),)
+        )
+        if not fulfilled or fulfilled[0] not in ("paid", "fulfilled"):
+            await update_order_status(payment.get("order_id"), "failed", error="Insufficient stock")
+            pending_payments.pop(invoice_id, None)
+            return _webapp_response({"error": "Товар закончился во время оплаты"}, 409)
+    pending_payments.pop(invoice_id, None)
+    row = await fetchone(
+        "SELECT order_number, status, total FROM orders WHERE id = ?",
+        (payment.get("order_id"),),
+    )
+    return _webapp_response({
+        "ok": True, "status": "paid", "order_id": payment.get("order_id"),
+        "order_number": row[0] if row else payment.get("order_number"),
+        "amount": row[2] if row else payment["total"],
+    })
+
 @dp.message(F.web_app_data)
 async def webapp_purchase(message: types.Message):
     try:
@@ -3669,76 +6059,182 @@ async def webapp_purchase(message: types.Message):
     if payload.get("action") != "purchase":
         await message.answer("❌ Неизвестное действие Web App.")
         return
-    try:
-        cat_id = int(payload["cat_id"])
-        quantity = int(payload["quantity"])
-    except (KeyError, TypeError, ValueError):
-        await message.answer("❌ Некорректные данные покупки.")
+    raw_items = payload.get("items")
+    if raw_items is None:
+        raw_items = [{"cat_id": payload.get("cat_id"), "quantity": payload.get("quantity")}]
+    if not isinstance(raw_items, list) or not raw_items or len(raw_items) > 20:
+        await message.answer("❌ Некорректная корзина.")
         return
-    if quantity < 1 or quantity > MAX_QUANTITY_PER_PURCHASE:
-        await message.answer("❌ Некорректное количество товара.")
+    cart_items = []
+    seen = set()
+    for raw_item in raw_items:
+        try:
+            cat_id = int(raw_item["cat_id"])
+            quantity = int(raw_item["quantity"])
+        except (KeyError, TypeError, ValueError):
+            await message.answer("❌ Некорректные данные покупки.")
+            return
+        if quantity < 1 or quantity > MAX_QUANTITY_PER_PURCHASE or cat_id in seen:
+            await message.answer("❌ Некорректное количество товара.")
+            return
+        seen.add(cat_id)
+        cart_items.append((cat_id, quantity))
+    categories_data = []
+    base_total = 0.0
+    for cat_id, quantity in cart_items:
+        category = await fetchone(
+            "SELECT id, name, price FROM categories WHERE id = ? AND maintenance = 0",
+            (cat_id,),
+        )
+        if not category:
+            await message.answer("❌ Категория товара недоступна.")
+            return
+        stock = await fetchone("SELECT COUNT(*) FROM inventory WHERE cat_id = ?", (cat_id,))
+        if not stock or stock[0] < quantity:
+            await message.answer("❌ Недостаточно товара в наличии.")
+            return
+        line_total = float(category[2]) * quantity
+        if quantity >= 10:
+            line_total *= 0.8
+        base_total += line_total
+        categories_data.append(category)
+    base_total = round(base_total, 2)
+    promo_code = str(payload.get("promo_code", "")).strip().upper()
+    if promo_code and (
+        len(promo_code) > 64 or not re.fullmatch(r"[A-Z0-9_-]+", promo_code)
+    ):
+        await message.answer("❌ Некорректный промокод.")
         return
-    category = await fetchone(
-        "SELECT id, name, price FROM categories WHERE id = ? AND maintenance = 0",
-        (cat_id,),
-    )
-    if not category:
-        await message.answer("❌ Категория товара недоступна.")
-        return
-    cat_id, cat_name, price = category
-    stock = await fetchone("SELECT COUNT(*) FROM inventory WHERE cat_id = ?", (cat_id,))
-    if not stock or stock[0] < quantity:
-        await message.answer("❌ Недостаточно товара в наличии.")
-        return
-    total = round(float(price) * quantity, 2)
+    promo_percent = 0.0
+    if promo_code:
+        promo = await fetchone(
+            "SELECT amount, max_uses, used, promo_type FROM promo_codes WHERE code = ?",
+            (promo_code,),
+        )
+        already_used = await fetchone(
+            "SELECT 1 FROM promo_usage WHERE code = ? AND user_id = ? LIMIT 1",
+            (promo_code, message.from_user.id),
+        )
+        if (
+            not promo or already_used or promo[3] != "percent"
+            or int(promo[2] or 0) >= int(promo[1] or 0)
+        ):
+            await message.answer("❌ Промокод недействителен или уже использован.")
+            return
+        promo_percent = min(max(float(promo[0]), 0), 100)
+    total = round(base_total * (1 - promo_percent / 100), 2)
     payment = payload.get("payment")
+    if payment == "stars":
+        if len(cart_items) != 1:
+            await message.answer("❌ Telegram Stars доступны только для одного товара.")
+            return
+        stars = max(1, int(round(total * STAR_USDT_RATE)))
+        cat_id, item_quantity = cart_items[0]
+        await message.answer_invoice(
+            title="Покупка в ALTERA",
+            description=f"{categories_data[0][1]} x{item_quantity} — {total:.2f} USDT",
+            payload=json.dumps({
+                "type": "purchase",
+                "cat_id": cat_id,
+                "quantity": item_quantity,
+                "total": total,
+            }, separators=(",", ":")),
+            currency="XTR",
+            prices=[LabeledPrice(
+                label=f"{categories_data[0][1]} x{item_quantity}",
+                amount=stars,
+            )],
+        )
+        return
     if payment == "balance":
-        items = await buy_items_with_transaction(cat_id, quantity, message.from_user.id, total)
+        if len(cart_items) == 1:
+            cat_id, quantity = cart_items[0]
+            items = await buy_items_with_transaction(
+                cat_id, quantity, message.from_user.id, base_total, promo_code
+            )
+            review_markup = purchase_review_keyboard(cat_id).as_markup()
+        else:
+            items = await buy_cart_with_transaction(
+                cart_items, message.from_user.id, base_total, promo_code
+            )
+            review_markup = None
         if not items:
             await message.answer("❌ Недостаточно средств или товар закончился.")
             return
         text = "✅ Покупка оплачена с баланса!\n\n🎁 Ваш товар:\n"
         text += "\n".join(f"• {hcode(item_data)}" for _, item_data in items)
-        await message.answer(text, parse_mode="HTML", reply_markup=purchase_review_keyboard(cat_id).as_markup())
+        await message.answer(text, parse_mode="HTML", reply_markup=review_markup)
         return
-    if payment != "xrocket":
-        await message.answer("❌ Выберите способ оплаты: баланс или xRocket.")
+    if payment not in {"xrocket", "cryptobot"}:
+        await message.answer("❌ Выберите способ оплаты: баланс, xRocket или CryptoBot.")
         return
-    inv = await xrocket_create_invoice(
-        amount=total,
-        description=f"{cat_name} x{quantity}",
-        expired_in=1800,
+    if promo_code:
+        reserved_percent = await _reserve_webapp_percent_promo(
+            message.from_user.id, promo_code
+        )
+        if reserved_percent is None:
+            await message.answer("❌ Промокод уже использован или недействителен.")
+            return
+    description = ", ".join(
+        f"{category[1]} x{quantity}" for category, (_, quantity) in zip(categories_data, cart_items)
     )
+    if payment == "xrocket":
+        inv = await xrocket_create_invoice(
+            amount=total,
+            description=description,
+            expired_in=1800,
+        )
+    else:
+        inv = await cryptobot_create_invoice(
+            amount=total,
+            description=f"Покупка ALTERA: {description}",
+            payload=json.dumps(
+                {"type": "purchase", "user_id": message.from_user.id},
+                separators=(",", ":"),
+            ),
+            expires_in=1800,
+        )
     if not inv.get("ok"):
         await message.answer(
             f"❌ Не удалось создать счёт: {html.escape(inv.get('description', 'ошибка API'))}",
             parse_mode="HTML",
         )
         return
-    invoice_id = inv["id"]
+    invoice_id = str(inv["id"])
+    first_cat_id, first_quantity = cart_items[0]
     pending_payments[invoice_id] = {
         "user_id": message.from_user.id,
-        "cat_id": cat_id,
-        "quantity": quantity,
+        "cat_id": first_cat_id if len(cart_items) == 1 else None,
+        "quantity": first_quantity,
+        "cart_items": cart_items if len(cart_items) > 1 else None,
         "total": total,
         "created_at": datetime.now(),
         "is_preorder": False,
-        "provider": "xrocket",
+        "provider": payment,
     }
     kb = InlineKeyboardBuilder()
-    kb.button(text="Оплатить", url=inv["link"], icon_custom_emoji_id=CustomEmoji.XROCKET_PAY, style="success")
+    if payment == "xrocket":
+        kb.button(text="Оплатить через xRocket", url=inv["link"], icon_custom_emoji_id=CustomEmoji.XROCKET_PAY, style="success")
+    else:
+        kb.button(text="Оплатить через CryptoBot", url=inv["link"], icon_custom_emoji_id=CustomEmoji.CRYPTOBOT_PAY, style="success")
     kb.button(text="Проверить оплату", callback_data=f"check_payment_{invoice_id}", icon_custom_emoji_id=CustomEmoji.CHECKPAY, style="primary")
-    kb.button(text="Отменить заказ", callback_data=f"cancel_payment_{invoice_id}", icon_custom_emoji_id="5215248628548931525", style="danger")
+    if payment == "xrocket":
+        kb.button(text="Отменить заказ", callback_data=f"cancel_payment_{invoice_id}", icon_custom_emoji_id="5215248628548931525", style="danger")
     kb.adjust(1)
     msg = await message.answer(
-        f"💳 <b>{html.escape(cat_name)} × {quantity}</b>\n"
+        f"💳 <b>{html.escape(description)}</b>\n"
         f"Сумма: <b>{total:.2f} USDT</b>\n\n"
         "Счёт действителен 30 минут.",
         parse_mode="HTML",
         reply_markup=kb.as_markup(),
     )
     pending_payments[invoice_id]["msg"] = msg
-    asyncio.create_task(auto_check_payment(invoice_id, message.from_user.id, cat_id, quantity, msg, total, "xrocket"))
+    asyncio.create_task(auto_check_payment(
+        invoice_id, message.from_user.id,
+        first_cat_id if len(cart_items) == 1 else None,
+        first_quantity, msg, total, payment,
+        cart_items if len(cart_items) > 1 else None,
+    ))
 
 @dp.pre_checkout_query()
 async def stars_pre_checkout(query: types.PreCheckoutQuery):
@@ -3772,9 +6268,20 @@ async def stars_successful_payment(message: types.Message):
         await message.answer("❌ Неизвестный тип платежа.")
         return
     items = await buy_items_with_transaction(
-        int(payload["cat_id"]), int(payload["quantity"]), message.from_user.id, float(payload["total"])
+        int(payload["cat_id"]),
+        int(payload["quantity"]),
+        message.from_user.id,
+        float(payload.get("base_total", payload["total"])),
+        payload.get("promo_code") or None,
+        order_id=int(payload["order_id"]) if payload.get("order_id") else None,
+        payment_method="stars",
     )
     if not items:
+        if payload.get("order_id") and await fetchone(
+            "SELECT 1 FROM orders WHERE id = ? AND status IN ('paid', 'fulfilled')",
+            (int(payload["order_id"]),),
+        ):
+            return
         await message.answer("❌ Товар закончился во время оплаты. Обратитесь в поддержку.")
         return
     result = "✅ Оплата через Telegram Stars подтверждена!\n\n🎁 Ваш товар:\n"
@@ -3841,6 +6348,20 @@ async def claim_check_from_message(message: types.Message, token: str):
         return
     status, amount, creator_id, comment = await claim_balance_check(token, message.from_user.id)
     if status == "claimed":
+        nickname = (
+            message.from_user.username
+            or message.from_user.first_name
+            or str(message.from_user.id)
+        )
+        notification_amount = f"{amount:.2f}".rstrip("0").rstrip(".")
+        try:
+            await get_active_bot().send_message(
+                creator_id,
+                f"{html.escape(nickname)} активировал(-а) ваш чек на {notification_amount}$",
+                parse_mode="HTML",
+            )
+        except TelegramAPIError as exc:
+            logger.warning("Не удалось уведомить создателя чека %s: %s", creator_id, exc)
         text = f"✅ Чек активирован. На ваш баланс зачислено {amount:.2f} USDT."
         if comment:
             text += f"\n\n💬 Комментарий: {html.escape(comment)}"
@@ -3849,6 +6370,8 @@ async def claim_check_from_message(message: types.Message, token: str):
         await message.answer("⌛ Срок действия чека истёк. Средства возвращены создателю.")
     elif status == "already_claimed":
         await message.answer("ℹ️ Этот чек уже активирован.")
+    elif status == "already_claimed_by_user":
+        await message.answer("ℹ️ Вы уже активировали этот чек.")
     elif status == "already_expired":
         await message.answer("ℹ️ Этот чек уже использован.")
     elif status == "wrong_recipient":
@@ -3863,6 +6386,7 @@ async def cmd_create_check(message: types.Message):
     if not spec:
         await message.answer(
             "Использование: /check 100 4 оплата услуги\n"
+            "Для десяти пользователей: /check 50 10 (по 5 USDT на пользователя)\n"
             "Для конкретного пользователя: /check 100 1 @username оплата услуги"
         )
         return
@@ -4009,11 +6533,15 @@ async def create_inline_check_cb(call: types.CallbackQuery):
         icon_custom_emoji_id="4925136584275134324",
         style="success",
     )
+    split_text = ""
+    if draft["claims"] > 1:
+        per_claim = draft["total"] / draft["claims"]
+        split_text = f' ({draft["claims"]} активации по {per_claim:.2f} USDT)'
+    comment_text = f' — {html.escape(draft["comment"])}' if draft["comment"] else ""
     check_text = (
         f'<blockquote><b><tg-emoji emoji-id="4924874531140535819">🎁</tg-emoji> '
         f'Чек ALTERA на {draft["total"]:.2f} USDT'
-        f'{" (" + str(draft["claims"]) + " активации по " + f"{draft["total"] / draft["claims"]:.2f}" + " USDT)" if draft["claims"] > 1 else ""}'
-        f'{" — " + html.escape(draft["comment"]) if draft["comment"] else ""}</b></blockquote>\n\n'
+        f'{split_text}{comment_text}</b></blockquote>\n\n'
         '<blockquote><b><tg-emoji emoji-id="5213354182899179724">💬</tg-emoji> '
         'Чтобы активировать данный чек, нажмите на кнопку ниже</b></blockquote>'
     )
@@ -4095,7 +6623,7 @@ async def send_welcome_message(message: types.Message):
         '<blockquote><b><tg-emoji emoji-id="5213256712911363107">🛡️</tg-emoji> Наши актуальные контакты:\n'
         "Основной бот маркет — @AlteraneBot\n"
         "Владелец проекта — @devAltera\n"
-        "Поддержка — в личных сообщениях</b></blockquote>\n\n"
+        "Поддержка — @HelpALTR</b></blockquote>\n\n"
         '<blockquote><b><tg-emoji emoji-id="5213464941515808062">🛡️</tg-emoji> Правила пользования сервисом:\n'
         f'<a href="{AGREEMENT_URL}">Пользовательское соглашение</a>\n'
         f'<a href="{PRIVACY_POLICY_URL}">Политика конфиденциальности</a></b></blockquote>',
@@ -4142,7 +6670,12 @@ async def back_to_main_menu_cb(call: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "back_to_faq")
 async def back_to_faq_cb(call: types.CallbackQuery, state: FSMContext):
-    await text_faq(call.message, call.from_user.id, state)
+    registration = await fetchone(
+        "SELECT accepted, privacy_accepted FROM users WHERE id = ?",
+        (call.from_user.id,),
+    )
+    onboarding = not registration or not registration[0] or registration[1] != 1
+    await text_faq(call.message, call.from_user.id, state, onboarding=onboarding)
     await call.answer()
 
 @dp.callback_query(F.data == "onboarding_agreement")
@@ -5873,7 +8406,8 @@ async def cmd_my_preorders(message: types.Message):
     await message.answer(text, parse_mode="HTML")
 
 @dp.callback_query(F.data == "back_to_profile")
-async def back_to_profile_cb(call: types.CallbackQuery):
+async def back_to_profile_cb(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
     await show_profile_with_image(call.from_user.id, call.message)
     await call.answer()
 
@@ -5963,7 +8497,7 @@ async def handle_add_stock_items(message: types.Message):
         await message.answer(f"✅ Все {len(items)} товаров получены. Введите /done для сохранения.")
 
 
-# ПРОВЕРКА ПЛАТЕЖЕЙ @xRocket / Telegram Stars / Balance
+# ПРОВЕРКА ПЛАТЕЖЕЙ @xRocket / CryptoBot / Telegram Stars / Balance
 
 # Обработчик для проверки оплаты товара (xRocket)
 @dp.callback_query(F.data.startswith("check_payment_"))
@@ -6004,20 +8538,31 @@ async def check_payment_cb(call: types.CallbackQuery):
 
     await call.answer("⏳ Проверяю статус оплаты...")
 
-    if provider == "xrocket":
-        inv = await xrocket_get_invoice(str(invoice_id))
-        if not inv.get('ok'):
-            await call.answer("⚠️ Ошибка при проверке платежа", show_alert=True)
-            return
-        is_paid = _xrocket_is_paid(inv.get('status'), inv.get('paid_amount'))
-        is_expired = _xrocket_is_expired(inv.get('status'))
-        logger.info(f"xRocket check: invoice_id={invoice_id}, status={inv.get('status')}, paid_amount={inv.get('paid_amount')}, is_paid={is_paid}, is_expired={is_expired}")
+    inv = await get_provider_invoice(provider, str(invoice_id))
+    if not inv.get("ok"):
+        await call.answer("⚠️ Ошибка при проверке платежа", show_alert=True)
+        return
+    is_paid = provider_invoice_is_paid(provider, inv)
+    is_expired = provider_invoice_is_expired(provider, inv)
     if is_paid:
-        # Платёж подтверждён
+        async with payment_finalize_lock:
+            if invoice_id not in pending_payments:
+                await call.answer("ℹ️ Счёт уже обработан.", show_alert=True)
+                return
+            if is_preorder:
+                if preorder_id:
+                    await execute_query(
+                        "UPDATE preorders SET status = 'paid', paid_at = ? WHERE id = ?",
+                        (datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), preorder_id),
+                        commit=True,
+                    )
+                items = None
+            else:
+                items = await buy_items_with_transaction(
+                    cat_id, quantity, user_id, total, payment_method=provider
+                )
+            pending_payments.pop(invoice_id, None)
         if is_preorder:
-            if preorder_id:
-                await execute_query("UPDATE preorders SET status = 'paid', paid_at = ? WHERE id = ?",
-                                  (datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), preorder_id), commit=True)
             await call.message.edit_text(
                 f'<tg-emoji emoji-id="{CustomEmoji.PREORDER_CHECK}">✅</tg-emoji> <b>Предзаказ оплачен!</b>\n\n'
                 f'Как только товар появится, он будет автоматически выдан вам.',
@@ -6025,7 +8570,6 @@ async def check_payment_cb(call: types.CallbackQuery):
             )
             await call.answer("✅ Предзаказ оплачен!", show_alert=True)
         else:
-            items = await buy_items_with_transaction(cat_id, quantity, user_id, total)
             if not items:
                 await call.message.edit_text(f'<tg-emoji emoji-id="{CustomEmoji.WARNING}">❌</tg-emoji> Товар закончился во время оплаты. Обратитесь в поддержку.', parse_mode="HTML")
                 await call.answer("❌ Товар закончился", show_alert=True)
@@ -6040,13 +8584,9 @@ async def check_payment_cb(call: types.CallbackQuery):
                 ref_bonus = round(total * 0.1, 2)
                 await add_referral_earning(referrer[0], ref_bonus, user_id)
                 await get_active_bot().send_message(referrer[0], f'<tg-emoji emoji-id="{CustomEmoji.MONEY}">💰</tg-emoji> Вы получили {ref_bonus} USDT (10%) от покупки!', parse_mode="HTML")
-        # Удаляем запись
-        if invoice_id in pending_payments:
-            del pending_payments[invoice_id]
     elif is_expired:
         await call.message.edit_text(f'<tg-emoji emoji-id="{CustomEmoji.WARNING}">❌</tg-emoji> Счёт просрочен. Создайте новый заказ.', parse_mode="HTML")
-        if invoice_id in pending_payments:
-            del pending_payments[invoice_id]
+        pending_payments.pop(invoice_id, None)
         await call.answer("❌ Счёт просрочен", show_alert=True)
     else:
         # Не оплачен и не просрочен – оставляем запись
@@ -6087,17 +8627,19 @@ async def check_balance_payment_cb(call: types.CallbackQuery):
 
     await call.answer("⏳ Проверяю статус оплаты...")
 
-    if provider == "xrocket":
-        inv = await xrocket_get_invoice(str(invoice_id))
-        if not inv.get('ok'):
-            await call.answer("⚠️ Ошибка при проверке платежа", show_alert=True)
-            return
-        is_paid = _xrocket_is_paid(inv.get('status'), inv.get('paid_amount'))
-        is_expired = _xrocket_is_expired(inv.get('status'))
-        logger.info(f"xRocket balance check: invoice_id={invoice_id}, status={inv.get('status')}, paid_amount={inv.get('paid_amount')}, is_paid={is_paid}, is_expired={is_expired}")
+    inv = await get_provider_invoice(provider, str(invoice_id))
+    if not inv.get("ok"):
+        await call.answer("⚠️ Ошибка при проверке платежа", show_alert=True)
+        return
+    is_paid = provider_invoice_is_paid(provider, inv)
+    is_expired = provider_invoice_is_expired(provider, inv)
     if is_paid:
-        await update_balance(user_id, amount, "deposit")
-        del pending_balance_payments[invoice_id]
+        async with payment_finalize_lock:
+            if invoice_id not in pending_balance_payments:
+                await call.answer("ℹ️ Пополнение уже обработано.", show_alert=True)
+                return
+            await update_balance(user_id, amount, "deposit")
+            pending_balance_payments.pop(invoice_id, None)
         try:
             await msg_to_edit.delete()
         except:
@@ -6106,7 +8648,7 @@ async def check_balance_payment_cb(call: types.CallbackQuery):
         await call.answer("✅ Баланс пополнен!", show_alert=True)
     elif is_expired:
         await msg_to_edit.edit_text(f'<tg-emoji emoji-id="{CustomEmoji.WARNING}">❌</tg-emoji> Счёт просрочен. Попробуйте снова.', parse_mode="HTML")
-        del pending_balance_payments[invoice_id]
+        pending_balance_payments.pop(invoice_id, None)
         await call.answer("❌ Счёт просрочен", show_alert=True)
     else:
         await call.answer("💳 Оплата пока не обнаружена. Счёт активен.", show_alert=True)
@@ -6148,6 +8690,7 @@ async def main():
         await setup_catalog()
         webapp_runner = await start_webapp_server()
         asyncio.create_task(cleanup_old_payments())
+        asyncio.create_task(cleanup_p2p_deals())
         if not hasattr(bot, 'user_promos'):
             bot.user_promos = {}
         await bot.set_my_commands(BOT_COMMANDS)

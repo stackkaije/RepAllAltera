@@ -2,3 +2,4 @@ aiogram
 pyotp
 aiohttp
 aiosqlite
+mnemonic
